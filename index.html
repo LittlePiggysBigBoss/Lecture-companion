@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        var EXT_RE = /^(chrome|moz|safari-web)-extension:\/\/|chrome-extension:\/\//i;
+        function isExtensionCrossFrameError(filename, message, stack) {
+          if (filename && EXT_RE.test(filename)) return true;
+          if (stack && EXT_RE.test(stack)) return true;
+          if (
+            message &&
+            message.indexOf('Blocked a frame with origin') !== -1 &&
+            message.indexOf('Location') !== -1
+          ) {
+            return true;
+          }
+          return false;
+        }
+        window.addEventListener(
+          'error',
+          function (e) {
+            var stack = e.error && typeof e.error.stack === 'string' ? e.error.stack : '';
+            if (isExtensionCrossFrameError(e.filename || '', e.message || '', stack)) {
+              e.stopImmediatePropagation();
+              e.preventDefault();
+            }
+          },
+          true
+        );
+        window.addEventListener(
+          'unhandledrejection',
+          function (e) {
+            var reason = e.reason;
+            var msg = reason && reason.message ? String(reason.message) : String(reason || '');
+            var stack = reason && typeof reason.stack === 'string' ? reason.stack : '';
+            if (isExtensionCrossFrameError('', msg, stack)) {
+              e.stopImmediatePropagation();
+              e.preventDefault();
+            }
+          },
+          true
+        );
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Carbon 学术讲义与题册工坊</title>
+    <meta name="description" content="基于 Gemini 4 Carbon 的全自动学术讲义与练习题册扩展撰写、多模态参考资料解析、PDF 排版导出及 Google Drive 自动建夹归档工作台。" />
+    <meta property="og:title" content="Carbon 学术讲义与题册工坊" />
+    <meta property="og:description" content="基于 Gemini 4 Carbon 的全自动学术讲义与练习题册扩展撰写、多模态参考资料解析、PDF 排版导出及 Google Drive 自动建夹归档工作台。" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

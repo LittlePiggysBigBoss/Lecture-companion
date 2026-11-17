@@ -1,0 +1,6 @@
+{
+  "name": "Carbon 学术讲义与题册工坊",
+  "description": "基于 Gemini 4 Carbon 的全自动学术讲义与练习题册扩展撰写、多模态参考资料解析、PDF 排版导出及 Google Drive 自动建夹归档工作台。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
