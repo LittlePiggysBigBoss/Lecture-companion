@@ -1,10 +1,13 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
-  BookCopy,
+  ArrowUpRight,
   BookOpen,
   BrainCircuit,
+  ChevronDown,
+  ChevronUp,
   ClipboardCheck,
   Coins,
+  Cpu,
   FileSpreadsheet,
   FileText,
   FolderGit2,
@@ -12,13 +15,14 @@ import {
   Loader2,
   Paperclip,
   Play,
-  Sparkles,
-  Upload,
+  SlidersHorizontal,
   X,
 } from 'lucide-react';
 import type {
+  ColorPaletteTheme,
   DepthPreset,
   DocMode,
+  PageOrientationMode,
   PipelineJob,
   PricingConfig,
   ScannedLinkResult,
@@ -33,6 +37,11 @@ import {
   detectMultiVolumeIntent,
   SINGLE_CALL_TARGET_WORDS_BY_DEPTH,
 } from '../utils/adaptiveWorkflowLogic';
+import { detectResolvedPageOrientation } from '../utils/pdfServerHelpers';
+import {
+  COLOR_PALETTE_THEMES,
+  DOCUMENT_TOOL_MODEL_REGISTRY,
+} from '../utils/modelRegistryAndRouter';
 import {
   DEFAULT_PRICING_CONFIG,
   estimateTaskTokenAndPrice,
@@ -41,6 +50,32 @@ import { buildDriveArchivePath } from '../utils/pipelineLogic';
 import { LinkRecognitionBar } from './LinkRecognitionBar';
 import { VoiceDictationButton } from './VoiceDictationButton';
 
+const THEME_SWATCH_STYLES: Record<
+  ColorPaletteTheme,
+  { swatchBg: string; shortLabel: string; activeRing: string }
+> = {
+  academic_blue: {
+    swatchBg: 'bg-blue-700',
+    shortLabel: '学术蓝',
+    activeRing: 'border-blue-500 bg-blue-50/80 text-blue-900 font-semibold',
+  },
+  emerald_science: {
+    swatchBg: 'bg-emerald-700',
+    shortLabel: '自然翠绿',
+    activeRing: 'border-emerald-500 bg-emerald-50/80 text-emerald-900 font-semibold',
+  },
+  amber_olympiad: {
+    swatchBg: 'bg-amber-600',
+    shortLabel: '竞赛鎏金',
+    activeRing: 'border-amber-500 bg-amber-50/80 text-amber-950 font-semibold',
+  },
+  burgundy_editorial: {
+    swatchBg: 'bg-rose-800',
+    shortLabel: '人文酒红',
+    activeRing: 'border-rose-500 bg-rose-50/80 text-rose-950 font-semibold',
+  },
+};
+
 interface ComposerPanelProps {
   mode: DocMode;
   onModeChange: (mode: DocMode) => void;
@@ -48,6 +83,12 @@ interface ComposerPanelProps {
   onDepthChange: (depth: DepthPreset) => void;
   volumeSplitMode: VolumeSplitMode;
   onVolumeSplitModeChange: (mode: VolumeSplitMode) => void;
+  pageOrientation?: PageOrientationMode;
+  onPageOrientationChange?: (mode: PageOrientationMode) => void;
+  colorTheme: ColorPaletteTheme;
+  onColorThemeChange: (theme: ColorPaletteTheme) => void;
+  autoGenerateFigures: boolean;
+  onAutoGenerateFiguresChange: (val: boolean) => void;
   prompt: string;
   onPromptChange: (val: string) => void;
   attachments: UploadedAttachment[];
@@ -87,6 +128,12 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   onDepthChange,
   volumeSplitMode,
   onVolumeSplitModeChange,
+  pageOrientation = 'auto',
+  onPageOrientationChange,
+  colorTheme,
+  onColorThemeChange,
+  autoGenerateFigures,
+  onAutoGenerateFiguresChange,
   prompt,
   onPromptChange,
   attachments,
@@ -120,6 +167,8 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [showAdvancedPanel, setShowAdvancedPanel] = useState(false);
+  const [showModelRegistry, setShowModelRegistry] = useState(false);
 
   const previewDrivePath = buildDriveArchivePath({
     rootFolder: customRootFolder,
@@ -146,6 +195,15 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
         explicitMode: volumeSplitMode,
       }),
     [prompt, volumeSplitMode]
+  );
+
+  const resolvedOrientation = useMemo(
+    () =>
+      detectResolvedPageOrientation({
+        explicitOrientation: pageOrientation,
+        rawPrompt: prompt,
+      }),
+    [pageOrientation, prompt]
   );
 
   const singleCallWordsTarget = SINGLE_CALL_TARGET_WORDS_BY_DEPTH[depth];
@@ -175,166 +233,19 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   };
 
   return (
-    <div className="max-w-4xl mx-auto space-y-8">
-      {/* Header Intro */}
+    <div className="max-w-4xl mx-auto space-y-7 pt-2 sm:pt-4">
+      {/* Editorial Studio Header */}
       <div className="space-y-2">
-        <h1
-          className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900"
-          style={{ textWrap: 'balance' }}
-        >
-          全自动学术讲义与练习题册生成工坊
+        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 text-balance">
+          深度学术讲义与练习题册生成工作台
         </h1>
-        <p className="text-sm sm:text-base text-slate-600 leading-relaxed max-w-3xl">
-          内置调用 Gemini 4 Carbon 深度推理与百万级长上下文记忆引擎。自动识别分册需求并输出多份独立 PDF 文件，充分利用模型单次调用输出极限，不设固定轮次上限——按内容真实体量需要多少轮自动拆分成多少轮。
+        <p className="text-sm sm:text-[15px] text-slate-600 leading-relaxed max-w-3xl">
+          直接输入课题要求、粘贴云盘或网页链接、或拖入任意体积参考资料。系统将在云端全自动完成总纲拆解、多模型精写、公式插图排版与矢量 PDF 编译，全程防中断续跑，无需手动值守。
         </p>
       </div>
 
-      <form onSubmit={onSubmitPipeline} className="space-y-6">
-        {/* Step 1: Document Mode + Depth Controls */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-700">1. 选择生成文档形态</span>
-              <span className="text-xs text-slate-500">自动匹配学术排版体例</span>
-            </div>
-            <div
-              className="grid grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg"
-              role="group"
-              aria-label="生成文档形态"
-            >
-              <button
-                type="button"
-                onClick={() => onModeChange('lecture_notes')}
-                className={`flex items-center justify-center gap-2 py-2 px-3 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                  mode === 'lecture_notes'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <BookOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>课程讲义 PDF</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => onModeChange('workbook')}
-                className={`flex items-center justify-center gap-2 py-2 px-3 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                  mode === 'workbook'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <ClipboardCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                <span>练习题册 PDF</span>
-              </button>
-            </div>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              {mode === 'lecture_notes'
-                ? '包含背景动机、严密定义、定理分步证明、几何/物理直觉、典型例题完整演算与章节小结。'
-                : '按基础巩固、进阶计算、综合压轴分级命题，每道题均自动附带完整分步推导与评分标准。'}
-            </p>
-          </div>
-
-          <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-700">
-                2. 单次调用极限密度与自适应轮次
-              </span>
-              <span className="text-xs text-slate-500 font-mono tabular-nums">
-                ~{singleCallWordsTarget.toLocaleString()} 字/轮 · 轮次无上限
-              </span>
-            </div>
-            <div
-              className="grid grid-cols-3 gap-1 p-1 bg-slate-100 rounded-lg"
-              role="group"
-              aria-label="生成深度档位"
-            >
-              {(
-                [
-                  { key: 'standard', label: '标准精编' },
-                  { key: 'comprehensive', label: '深度详尽' },
-                  { key: 'exhaustive', label: '全书穷尽' },
-                ] as const
-              ).map((item) => (
-                <button
-                  key={item.key}
-                  type="button"
-                  onClick={() => onDepthChange(item.key)}
-                  className={`py-2 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                    depth === item.key
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              {depth === 'standard' &&
-                '每轮压榨单次调用输出极限（约 8,500 字/轮），不设固定轮次上限，按章节真实体量自动拆分为 1..N 轮直出。'}
-              {depth === 'comprehensive' &&
-                '开启 Carbon High 深度推理，每轮满载输出约 11,500 字，不固定轮次，需要多少轮自动拆分成多少轮直至推导完备。'}
-              {depth === 'exhaustive' &&
-                '教材/竞赛全书级密度，每轮极限满载约 14,000 字，零人工干预动态排程任意所需轮次并开启截断自动续写。'}
-            </p>
-          </div>
-        </div>
-
-        {/* Step 1.5: Automatic Multi-Volume / Multi-File Output Strategy */}
-        <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <BookCopy className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
-              <span className="text-xs font-semibold text-slate-900">
-                3. 文件输出与自动分册策略（支持按章节分册 · 正文与答案解析拆分为多份独立 PDF）
-              </span>
-            </div>
-            <div
-              className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-lg self-start sm:self-auto"
-              role="group"
-              aria-label="文件分册输出策略"
-            >
-              {(
-                [
-                  { key: 'auto', label: '自动识别是否分册' },
-                  { key: 'multi_volume', label: '多份独立分册文件' },
-                  { key: 'single_file', label: '合并单份 PDF' },
-                ] as const
-              ).map((opt) => (
-                <button
-                  key={opt.key}
-                  type="button"
-                  onClick={() => onVolumeSplitModeChange(opt.key)}
-                  className={`py-1.5 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                    volumeSplitMode === opt.key
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div
-            className={`flex items-start gap-2 text-xs rounded-lg px-3 py-2 border ${
-              liveMultiVolumeDetection.shouldSplitVolumes
-                ? 'bg-blue-50/70 border-blue-200 text-blue-900'
-                : 'bg-slate-50 border-slate-200 text-slate-600'
-            }`}
-          >
-            <Sparkles
-              className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
-                liveMultiVolumeDetection.shouldSplitVolumes ? 'text-blue-600' : 'text-slate-400'
-              }`}
-              aria-hidden="true"
-            />
-            <span className="leading-relaxed">{liveMultiVolumeDetection.reasonSummary}</span>
-          </div>
-        </div>
-
-        {/* Step 2: Gemini-Style Multimodal Input Composer + Unlimited File Upload + Voice Dictation */}
+      <form onSubmit={onSubmitPipeline} className="space-y-4">
+        {/* Primary Focal Anchor: Conversational Multimodal Studio Box (Gemini Canvas / Claude Artifacts Flow) */}
         <div
           onDragOver={(e) => {
             e.preventDefault();
@@ -342,17 +253,140 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           }}
           onDragLeave={() => setIsDragging(false)}
           onDrop={handleDrop}
-          className={`bg-white border rounded-xl transition-colors ${
+          className={`bg-white border rounded-2xl transition-colors ${
             isDragging
-              ? 'border-blue-600 bg-blue-50/30'
+              ? 'border-blue-600 bg-blue-50/20'
               : validationError
                 ? 'border-red-400'
                 : 'border-slate-200 focus-within:border-slate-400'
           }`}
         >
+          {/* Top Compact Studio Parameter Strip */}
+          <div className="px-4 py-3 border-b border-slate-100 flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Document Mode */}
+              <div
+                className="inline-flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg"
+                role="group"
+                aria-label="生成文档形态"
+              >
+                <button
+                  type="button"
+                  onClick={() => onModeChange('lecture_notes')}
+                  className={`inline-flex items-center gap-1.5 py-1.5 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    mode === 'lecture_notes'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <BookOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>课程讲义 PDF</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onModeChange('workbook')}
+                  className={`inline-flex items-center gap-1.5 py-1.5 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    mode === 'workbook'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <ClipboardCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>练习题册 PDF</span>
+                </button>
+              </div>
+
+              {/* Page Orientation (Auto / Portrait A4 / Landscape PPT) */}
+              {onPageOrientationChange && (
+                <div
+                  className="inline-flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg"
+                  role="group"
+                  aria-label="PDF 页面版式"
+                >
+                  {(
+                    [
+                      { key: 'auto', label: '自动版式' },
+                      { key: 'portrait', label: '竖版 A4' },
+                      { key: 'landscape', label: '横版演示 PPT' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      onClick={() => onPageOrientationChange(opt.key)}
+                      className={`py-1.5 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        pageOrientation === opt.key
+                          ? 'bg-white text-slate-900 shadow-2xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Depth Preset */}
+              <div
+                className="inline-flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg"
+                role="group"
+                aria-label="生成深度档位"
+              >
+                {(
+                  [
+                    { key: 'standard', label: '标准精编' },
+                    { key: 'comprehensive', label: '深度详尽' },
+                    { key: 'exhaustive', label: '全书穷尽' },
+                  ] as const
+                ).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => onDepthChange(item.key)}
+                    className={`py-1.5 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      depth === item.key
+                        ? 'bg-white text-slate-900 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Multi-Volume Split Mode */}
+              <div
+                className="inline-flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg"
+                role="group"
+                aria-label="文件分册输出策略"
+              >
+                {(
+                  [
+                    { key: 'auto', label: '自动分册' },
+                    { key: 'multi_volume', label: '多册独立' },
+                    { key: 'single_file', label: '单册合编' },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => onVolumeSplitModeChange(opt.key)}
+                    className={`py-1.5 px-2.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      volumeSplitMode === opt.key
+                        ? 'bg-white text-slate-900 shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
           {/* Attachment Chips Tray + Chunked Upload Progress */}
           {(attachments.length > 0 || isParsingFiles || uploadProgress) && (
-            <div className="px-4 pt-4 pb-2 flex flex-wrap gap-2.5 border-b border-slate-100">
+            <div className="px-4 pt-3.5 pb-2 flex flex-wrap gap-2.5 border-b border-slate-100">
               {attachments.map((att) => (
                 <div
                   key={att.id}
@@ -415,7 +449,8 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
             </div>
           )}
 
-          <div className="p-4">
+          {/* Main Conversational Prompt Textarea */}
+          <div className="p-4 sm:p-5">
             <label htmlFor="carbon-prompt-input" className="sr-only">
               输入讲义或练习题册主题要求
             </label>
@@ -425,10 +460,15 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
               value={prompt}
               onChange={(e) => onPromptChange(e.target.value)}
               onPaste={handlePaste}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !isRunningPipeline && !isParsingFiles) {
+                  onSubmitPipeline(e as unknown as React.FormEvent);
+                }
+              }}
               placeholder={
                 mode === 'lecture_notes'
-                  ? '输入讲义要求，或直接粘贴 Google Drive 文件/文件夹链接、Google Docs、arXiv、PDF 网页链接（自动识别抓取并多模态扫描），支持语音口述与拖拽不限大小文件...'
-                  : '输入练习题册考察范围，或粘贴 Google Drive 真题链接 / 网页大纲链接（自动识别抓取），也可在下方面板勾选已完成讲义做长上下文配套命题...'
+                  ? '描述您想制作的课程讲义（例如：章节范围、是否需要横版 PPT 演示版式、是否将例题答案单独分册输出），可直接粘贴 Google Drive / arXiv / 网页链接或拖入不限大小教材...'
+                  : '描述练习题册考察范围与梯度要求（例如：基础+进阶+压轴证明题，正题与评分标准答案独立分册输出），支持粘贴真题链接或绑定已完成讲义...'
               }
               className="w-full resize-y text-sm sm:text-[15px] text-slate-900 placeholder:text-slate-400 bg-transparent focus:outline-none leading-relaxed"
             />
@@ -441,8 +481,54 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
             onScannedLinksChange={onScannedLinksChange}
           />
 
+          {/* Live Color Theme Swatches & Figure Toggle Row */}
+          <div className="px-4 py-2.5 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3">
+            <div
+              className="flex flex-wrap items-center gap-1.5"
+              role="radiogroup"
+              aria-label="出版级填色排版配色主题"
+            >
+              <span className="text-xs text-slate-500 mr-1 whitespace-nowrap">排版配色:</span>
+              {(Object.keys(COLOR_PALETTE_THEMES) as ColorPaletteTheme[]).map((themeKey) => {
+                const style = THEME_SWATCH_STYLES[themeKey];
+                const active = colorTheme === themeKey;
+                return (
+                  <button
+                    key={themeKey}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => onColorThemeChange(themeKey)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                      active
+                        ? style.activeRing
+                        : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span
+                      className={`w-2.5 h-2.5 rounded-xs shrink-0 ${style.swatchBg}`}
+                      aria-hidden="true"
+                    />
+                    <span>{style.shortLabel}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer whitespace-nowrap">
+              <input
+                id="auto-generate-figures-toggle"
+                type="checkbox"
+                checked={autoGenerateFigures}
+                onChange={(e) => onAutoGenerateFiguresChange(e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+              />
+              <span>Nano Banana 科学配图</span>
+            </label>
+          </div>
+
           {/* Bottom Composer Action Bar */}
-          <div className="px-4 py-3 bg-slate-50/70 border-t border-slate-200 rounded-b-xl flex flex-wrap items-center justify-between gap-3">
+          <div className="px-4 py-3 bg-slate-50/70 border-t border-slate-200 rounded-b-2xl flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
               <input
                 ref={fileInputRef}
@@ -461,7 +547,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isParsingFiles || isRunningPipeline}
-                className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
               >
                 <Paperclip className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
                 <span>上传文件（不限大小）</span>
@@ -469,16 +555,30 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
 
               <VoiceDictationButton
                 disabled={isParsingFiles || isRunningPipeline}
-                label="语音录入需求"
+                label="语音录入"
                 onTranscribed={(spoken) => {
                   onPromptChange(prompt.trim() ? `${prompt.trim()} ${spoken}` : spoken);
                 }}
                 onError={onVoiceError}
               />
 
-              <span className="text-xs text-slate-500 hidden xl:inline">
-                分片流式直传，支持 GB 级 PDF 教材、高清图集、DOCX 与音频
-              </span>
+              <button
+                type="button"
+                aria-expanded={showAdvancedPanel}
+                onClick={() => setShowAdvancedPanel((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
+                <span>
+                  高级记忆与云配置
+                  {sourceContextJobIds.length > 0 ? ` (已绑 ${sourceContextJobIds.length})` : ''}
+                </span>
+                {showAdvancedPanel ? (
+                  <ChevronUp className="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
+                )}
+              </button>
             </div>
 
             <button
@@ -489,236 +589,291 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
               {isRunningPipeline ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
-                  <span>正在挂载至云端后台...</span>
+                  <span>正在启动全自动流水线...</span>
                 </>
               ) : (
                 <>
                   <Play className="w-4 h-4 fill-current" aria-hidden="true" />
-                  <span>启动全自动生成与云端托管</span>
+                  <span>启动全自动生成</span>
                 </>
               )}
             </button>
           </div>
         </div>
 
+        {/* Quiet Inline Live Intent & Cost Summary Line (Zero Pill Boxes) */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-1 text-xs text-slate-500 font-mono tabular-nums">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-sans">
+            <span className={resolvedOrientation === 'landscape' ? 'text-blue-700 font-medium' : ''}>
+              {resolvedOrientation === 'landscape'
+                ? '版式：横版宽屏演示 PPT (297×210mm)'
+                : '版式：竖版标准 A4 (210×297mm)'}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span
+              className={
+                liveMultiVolumeDetection.shouldSplitVolumes ? 'text-blue-700 font-medium' : ''
+              }
+            >
+              {liveMultiVolumeDetection.shouldSplitVolumes
+                ? liveMultiVolumeDetection.reasonSummary
+                : '输出：单份完整矢量 PDF'}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-mono tabular-nums">
+              单模块甜区 ~{singleCallWordsTarget.toLocaleString()} 字
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span>
+              预估 ~{liveCostEstimate.estimatedPages} 页 ·{' '}
+              {(liveCostEstimate.estimatedTotalTokens / 1000).toFixed(1)}k Tokens
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="font-sans">
+              {accountProfile?.isSuperAdmin
+                ? '超管免计费'
+                : accountProfile?.subscriptionActive
+                  ? '包月配额结算'
+                  : `预估 ¥${liveCostEstimate.payPerPdfPriceCny.toFixed(2)}`}
+            </span>
+          </div>
+        </div>
+
         {validationError && (
-          <p role="alert" className="text-xs font-medium text-red-600">
+          <p role="alert" className="text-xs font-medium text-red-600 px-1">
             {validationError}
           </p>
         )}
 
-        {/* Step 2.5: Strong Historical Memory & Long-Context Reference Binding Panel */}
-        <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div className="flex items-center gap-2.5">
-              <BrainCircuit className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
-              <label
-                htmlFor="historical-memory-toggle"
-                className="text-xs font-semibold text-slate-900 cursor-pointer"
-              >
-                强历史记忆与超长上下文理解引擎（跨任务符号体系一致 · 支持绑定已完成讲义/题册深层续写）
-              </label>
-            </div>
-            <div className="flex items-center gap-3 shrink-0">
-              {sourceContextJobIds.length > 0 && (
-                <button
-                  type="button"
-                  onClick={onClearSourceContextJobs}
-                  className="text-xs text-blue-700 hover:underline whitespace-nowrap"
-                >
-                  清空已选基准 ({sourceContextJobIds.length})
-                </button>
+        {/* Collapsible Advanced Drawer: Long-Context Reference Binding, Personal Cloud & 12-Model Registry */}
+        {showAdvancedPanel && (
+          <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
+            {/* Section A: Strong Historical Memory & Long-Context Reference Binding */}
+            <div className="p-4 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <BrainCircuit className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
+                  <label
+                    htmlFor="historical-memory-toggle"
+                    className="text-xs font-semibold text-slate-900 cursor-pointer"
+                  >
+                    强历史记忆与超长上下文基准绑定（自动对齐跨任务符号体系、定理与习题编号）
+                  </label>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  {sourceContextJobIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={onClearSourceContextJobs}
+                      className="text-xs text-blue-700 hover:underline whitespace-nowrap shrink-0"
+                    >
+                      清空已选 ({sourceContextJobIds.length})
+                    </button>
+                  )}
+                  <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer whitespace-nowrap">
+                    <input
+                      id="historical-memory-toggle"
+                      type="checkbox"
+                      checked={enableHistoricalMemory}
+                      onChange={(e) => onEnableHistoricalMemoryChange(e.target.checked)}
+                      className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                    />
+                    <span>启用全局历史记忆</span>
+                  </label>
+                </div>
+              </div>
+
+              {availableHistoricalJobs.length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="text-xs text-slate-600">
+                    勾选已有已完成文档作为本次生成的长上下文基准（已选{' '}
+                    <span className="font-mono tabular-nums font-semibold">
+                      {sourceContextJobIds.length}
+                    </span>{' '}
+                    份）：
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-40 overflow-y-auto pr-1">
+                    {availableHistoricalJobs.slice(0, 10).map((hj) => {
+                      const checked = sourceContextJobIds.includes(hj.id);
+                      const hjTitle =
+                        hj.plan?.documentTitle || hj.rawUserPrompt.slice(0, 36) || '未命名文档';
+                      return (
+                        <label
+                          key={hj.id}
+                          className={`flex items-start gap-2.5 px-3 py-2 rounded-lg border text-xs cursor-pointer transition-colors ${
+                            checked
+                              ? 'bg-blue-50/70 border-blue-300 text-slate-900'
+                              : 'bg-slate-50/60 border-slate-200 text-slate-700 hover:bg-slate-100/70'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => onToggleSourceContextJobId(hj.id)}
+                            className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 shrink-0"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="font-semibold truncate">{hjTitle}</div>
+                            <div className="text-[11px] text-slate-500 font-mono tabular-nums">
+                              {hj.mode === 'workbook' ? '题册' : '讲义'} ·{' '}
+                              {hj.charCount.toLocaleString()} 字 · {hj.estimatedPages} 页
+                            </div>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
               )}
-              <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer whitespace-nowrap">
+            </div>
+
+            {/* Section B: Personal Google Cloud Archive & Billing Summary */}
+            <div className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="space-y-1 min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <FolderGit2 className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
+                  <label
+                    htmlFor="auto-archive-toggle"
+                    className="text-xs font-semibold text-slate-900 cursor-pointer"
+                  >
+                    个人 Google Cloud 自动托管与多终端同步（关机断网不影响后台生成）
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500 truncate">
+                  归档路径：<span className="font-mono text-slate-700">{previewDrivePath.fullPath}</span>
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                {!hasDriveToken && onRequestGoogleSignIn && (
+                  <button
+                    type="button"
+                    disabled={isSigningIn}
+                    onClick={onRequestGoogleSignIn}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+                  >
+                    <span>连接个人 Google Cloud</span>
+                  </button>
+                )}
+                <div className="flex items-center gap-1.5">
+                  <label
+                    htmlFor="drive-root-folder-input"
+                    className="text-xs text-slate-500 whitespace-nowrap"
+                  >
+                    目录:
+                  </label>
+                  <input
+                    id="drive-root-folder-input"
+                    type="text"
+                    value={customRootFolder}
+                    onChange={(e) => onCustomRootFolderChange(e.target.value)}
+                    placeholder="Carbon 学术归档"
+                    className="w-36 px-2.5 py-1.5 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+                  />
+                </div>
                 <input
-                  id="historical-memory-toggle"
+                  id="auto-archive-toggle"
                   type="checkbox"
-                  checked={enableHistoricalMemory}
-                  onChange={(e) => onEnableHistoricalMemoryChange(e.target.checked)}
+                  checked={autoArchiveDrive}
+                  onChange={(e) => onAutoArchiveDriveChange(e.target.checked)}
                   className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
                 />
-                <span>启用全局历史记忆</span>
-              </label>
-            </div>
-          </div>
-
-          <p className="text-xs text-slate-500 leading-relaxed">
-            开启后，模型自动读取您历史任务的学科偏好、LaTeX 记号与章节脉络；勾选下方已完成或大容量文档后，系统将把其全量正文与定理/题号总账注入长上下文，实现配套题册或续篇讲义的无缝扩展。
-          </p>
-
-          {availableHistoricalJobs.length > 0 && (
-            <div className="space-y-1.5 pt-1">
-              <div className="text-xs font-medium text-slate-700">
-                可选：勾选作为本次任务长上下文基准的已有文档（已选 {sourceContextJobIds.length} 份）：
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-40 overflow-y-auto pr-1">
-                {availableHistoricalJobs.slice(0, 8).map((hj) => {
-                  const checked = sourceContextJobIds.includes(hj.id);
-                  const hjTitle =
-                    hj.plan?.documentTitle || hj.rawUserPrompt.slice(0, 36) || '未命名文档';
-                  return (
-                    <label
-                      key={hj.id}
-                      className={`flex items-start gap-2.5 px-3 py-2 rounded-lg border text-xs cursor-pointer transition-colors ${
-                        checked
-                          ? 'bg-blue-50/70 border-blue-300 text-slate-900'
-                          : 'bg-slate-50/60 border-slate-200 text-slate-700 hover:bg-slate-100/70'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => onToggleSourceContextJobId(hj.id)}
-                        className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 shrink-0"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="font-semibold truncate">{hjTitle}</div>
-                        <div className="text-[11px] text-slate-500 font-mono tabular-nums">
-                          {hj.mode === 'workbook' ? '题册' : '讲义'} ·{' '}
-                          {hj.charCount.toLocaleString()} 字 · {hj.estimatedPages} 页 A4
-                        </div>
-                      </div>
-                    </label>
-                  );
-                })}
+                {onOpenBillingTab && (
+                  <button
+                    type="button"
+                    onClick={onOpenBillingTab}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 border border-slate-200 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0"
+                  >
+                    <Coins className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
+                    <span>计费与配额详情</span>
+                  </button>
+                )}
               </div>
             </div>
-          )}
-        </div>
 
-        {/* Step 3: Real-Time Per-Page Token Cost & Quota Settlement Bar */}
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-start gap-2.5 min-w-0">
-            <Coins className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" aria-hidden="true" />
-            <div className="space-y-0.5 text-xs">
-              <div className="font-semibold text-slate-900 font-mono tabular-nums">
-                预估约 {liveCostEstimate.estimatedPages} 页 A4 ·{' '}
-                {(liveCostEstimate.estimatedTotalTokens / 1000).toFixed(1)}k Tokens · 按页单价 ¥
-                {liveCostEstimate.perPagePriceCny.toFixed(2)}/页
-              </div>
-              <div className="text-slate-500">
-                {accountProfile?.isSuperAdmin ? (
-                  <span className="text-emerald-700 font-medium">
-                    当前账号为超级管理员（永久免收费用 · 不受 6 小时与周配额限制）
-                  </span>
-                ) : accountProfile?.subscriptionActive ? (
-                  <span className="text-emerald-700 font-medium">
-                    已启用 ¥{pricingConfig.monthlyPriceCny}/月 包月会员配额（6h 窗口剩余{' '}
-                    {Math.max(
-                      0,
-                      pricingConfig.sixHourTokenLimit - accountProfile.usage.sixHourTokensUsed
-                    ).toLocaleString()}{' '}
-                    Tokens）
-                  </span>
-                ) : (
+            {/* Section C: Multi-Model Tool Registry Disclosure */}
+            <div className="p-4 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs text-slate-600">
+                  <Cpu className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
                   <span>
-                    新用户按页单次价（50% 毛利标准）：
-                    <span className="font-mono font-semibold text-slate-900">
-                      {' '}
-                      ¥{liveCostEstimate.payPerPdfPriceCny.toFixed(2)}
-                    </span>{' '}
-                    · 或开通{' '}
-                    <span className="font-mono font-semibold text-blue-700">
-                      ¥{pricingConfig.monthlyPriceCny}/月
-                    </span>{' '}
-                    包月会员
+                    已接入{' '}
+                    <strong className="text-slate-900 font-mono tabular-nums">
+                      {DOCUMENT_TOOL_MODEL_REGISTRY.length}
+                    </strong>{' '}
+                    款专精工具模型（Carbon 主控编排 · Argon 演算 · Hydrogen 排版 · Nano Banana 配图）
                   </span>
-                )}
+                </div>
+                <button
+                  type="button"
+                  aria-expanded={showModelRegistry}
+                  onClick={() => setShowModelRegistry((prev) => !prev)}
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700 hover:text-blue-800 whitespace-nowrap shrink-0 self-start sm:self-auto"
+                >
+                  <span>
+                    {showModelRegistry
+                      ? '收起工具模型明细'
+                      : `查看全部 ${DOCUMENT_TOOL_MODEL_REGISTRY.length} 款工具模型分工`}
+                  </span>
+                  {showModelRegistry ? (
+                    <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                  )}
+                </button>
               </div>
-            </div>
-          </div>
 
-          {onOpenBillingTab && (
-            <button
-              type="button"
-              onClick={onOpenBillingTab}
-              className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 border border-slate-200 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 self-start sm:self-center"
-            >
-              计费标准与专属云配置
-            </button>
-          )}
-        </div>
-
-        {/* Step 4: Per-User Personal Google Cloud Hosting Bar */}
-        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="space-y-1.5 min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2.5">
-              <FolderGit2 className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
-              <label
-                htmlFor="auto-archive-toggle"
-                className="text-xs font-semibold text-slate-800 cursor-pointer"
-              >
-                个人专属 Google Cloud 离线托管 · 多端实时同步 · 仅点击下载时拉取至本地
-              </label>
-            </div>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              个人云目录：<span className="font-mono text-slate-700">{previewDrivePath.fullPath}</span>
-              {hasDriveToken ? (
-                <span className="text-emerald-700 font-medium">
-                  {' '}
-                  · 已挂载您本人的 Google Cloud，关机或断网不影响执行
-                </span>
-              ) : (
-                <span className="text-amber-700">
-                  {' '}
-                  · 登录账号后自动绑定您的个人 Google Cloud 并开启多终端同步
-                </span>
+              {showModelRegistry && (
+                <div className="border border-slate-200 rounded-lg overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                        <th className="py-2 px-3 font-semibold whitespace-nowrap">模型代号 / ID</th>
+                        <th className="py-2 px-3 font-semibold whitespace-nowrap">专精板块能力</th>
+                        <th className="py-2 px-3 font-semibold whitespace-nowrap">介入节点</th>
+                        <th className="py-2 px-3 font-semibold text-right whitespace-nowrap">
+                          成本权重
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {DOCUMENT_TOOL_MODEL_REGISTRY.map((entry) => (
+                        <tr key={entry.modelId} className="hover:bg-slate-50/70 align-top">
+                          <td className="py-2 px-3 whitespace-nowrap">
+                            <div className="font-semibold text-slate-900">{entry.codeName}</div>
+                            <div className="text-[11px] font-mono text-slate-500">
+                              {entry.modelId}
+                            </div>
+                          </td>
+                          <td className="py-2 px-3 text-slate-700 min-w-[220px] leading-relaxed">
+                            {entry.bestForSummary}
+                          </td>
+                          <td className="py-2 px-3 text-slate-600 max-w-[190px] leading-relaxed">
+                            {entry.workflowStages.join(' · ')}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-800 whitespace-nowrap">
+                            {(entry.relativeTokenCostIndex * 100).toFixed(0)}%
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
-            {!hasDriveToken && onRequestGoogleSignIn && (
-              <button
-                type="button"
-                disabled={isSigningIn}
-                onClick={onRequestGoogleSignIn}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
-              >
-                {isSigningIn ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-                ) : (
-                  <FolderGit2 className="w-3.5 h-3.5" aria-hidden="true" />
-                )}
-                <span>连接个人 Google Cloud</span>
-              </button>
-            )}
-
-            <div className="flex items-center gap-2">
-              <label
-                htmlFor="drive-root-folder-input"
-                className="text-xs text-slate-500 whitespace-nowrap"
-              >
-                总归档夹:
-              </label>
-              <input
-                id="drive-root-folder-input"
-                type="text"
-                value={customRootFolder}
-                onChange={(e) => onCustomRootFolderChange(e.target.value)}
-                placeholder="Carbon 学术归档"
-                className="w-36 px-2.5 py-1.5 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
-              />
             </div>
-
-            <input
-              id="auto-archive-toggle"
-              type="checkbox"
-              checked={autoArchiveDrive}
-              onChange={(e) => onAutoArchiveDriveChange(e.target.checked)}
-              className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
-            />
           </div>
-        </div>
+        )}
       </form>
 
-      {/* Quick Academic Starter Prompts */}
-      <div className="space-y-3 pt-2 border-t border-slate-200">
+      {/* Starter Prompt Cards (Clean 2-Column Editorial Examples) */}
+      <div className="space-y-3 pt-2">
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-semibold text-slate-700">
-            快速填充典型学术指令示例（演示简短输入如何自动扩展）
+            精选示例模板（涵盖课程讲义、分级题册、多卷独立分册与横版 PPT 演示课件）
           </h2>
-          <span className="text-xs text-slate-500">点击即可载入输入框</span>
+          <span className="text-xs text-slate-500">点击一键载入</span>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {STARTER_TEMPLATES.map((tpl) => (
@@ -728,16 +883,16 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
               onClick={() => {
                 onModeChange(tpl.mode);
                 onVolumeSplitModeChange('auto');
+                if (onPageOrientationChange) {
+                  onPageOrientationChange('auto');
+                }
                 onPromptChange(tpl.prompt);
               }}
               className="text-left p-3.5 bg-white border border-slate-200 rounded-xl hover:border-slate-300 hover:bg-slate-50/60 transition-colors space-y-1.5"
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-slate-900 truncate">{tpl.label}</span>
-                <Upload
-                  className="w-3.5 h-3.5 text-slate-400 shrink-0 rotate-90"
-                  aria-hidden="true"
-                />
+                <ArrowUpRight className="w-3.5 h-3.5 text-slate-400 shrink-0" aria-hidden="true" />
               </div>
               <p className="text-xs text-slate-500 line-clamp-2 leading-relaxed">{tpl.prompt}</p>
             </button>

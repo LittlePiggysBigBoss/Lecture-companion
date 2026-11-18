@@ -1,5 +1,6 @@
 import type {
   BatchExecutionState,
+  ColorPaletteTheme,
   ConsolidatedRequirementItem,
   ConsolidatedRequirementState,
   DepthPreset,
@@ -7,6 +8,7 @@ import type {
   ExpandedPlan,
   GeneratedVolumeArtifact,
   OutputVolumeSpec,
+  PageOrientationMode,
   PipelineJob,
   RequirementCategory,
   ScannedLinkResult,
@@ -14,23 +16,30 @@ import type {
   TaskBatchSpec,
   VolumeRole,
   VolumeSplitMode,
-} from '../types';
+} from '../types.ts';
 import {
   extractAcademicHeadingAndSymbolLedger,
   windowLongMarkdownContext,
-} from './linkAndMemoryLogic';
-import { countAcademicMetrics, normalizePdfFileName } from './pipelineLogic';
+} from './linkAndMemoryLogic.ts';
+import { detectResolvedPageOrientation } from './pdfServerHelpers.ts';
+import {
+  clampModuleWordsToQualitySweetSpot,
+  getToolModelEntry,
+  normalizeModuleVisualFigures,
+  QUALITY_SWEET_SPOT_WORDS_BY_DEPTH,
+  routeSpecialistModelForBatch,
+  stitchModularSectionsIntoDocument,
+} from './modelRegistryAndRouter.ts';
+import { countAcademicMetrics, normalizePdfFileName } from './pipelineLogic.ts';
 
 /**
- * Single-call coherent academic output target (in Chinese chars / English words)
- * calibrated to push Gemini 4 Carbon's single-call output limit efficiently without
- * tiny fragmented calls, while letting total round count scale freely (1..N rounds).
+ * Quality-First Moderate Per-Call Output Target (in Chinese chars / English words).
+ * Moderately reduces single-call output volume (~3,600–5,800 chars/module) to prioritize
+ * mathematical proof rigor, layout cleanliness, and zero truncation, then stitches all
+ * modules seamlessly into the final unified or multi-volume document!
  */
-export const SINGLE_CALL_TARGET_WORDS_BY_DEPTH: Record<DepthPreset, number> = {
-  standard: 8500,
-  comprehensive: 11500,
-  exhaustive: 14000,
-};
+export const SINGLE_CALL_TARGET_WORDS_BY_DEPTH: Record<DepthPreset, number> =
+  QUALITY_SWEET_SPOT_WORDS_BY_DEPTH;
 
 export interface MultiVolumeIntentDetection {
   shouldSplitVolumes: boolean;
@@ -222,7 +231,7 @@ function classifyClauseCategory(clause: string): RequirementCategory {
   if (/真题|原创题|压轴|基础题|选择题|计算题|证明题|题量|难度|答案|解析|评分/.test(clause)) {
     return 'problem_design';
   }
-  if (/英文|中文|双语|符号|公式|LaTeX|图文|表格|排版|风格|语气/i.test(clause)) {
+  if (/英文|中文|双语|符号|公式|LaTeX|图文|表格|排版|风格|语气|横版|竖版|PPT|幻灯片|演示/i.test(clause)) {
     return 'style_notation';
   }
   return 'scope';
@@ -241,6 +250,8 @@ function detectConflictAxis(clause: string): string | null {
   }
   if (/不要答案|不附答案|不含解析/.test(clause)) return 'ans:none';
   if (/附完整答案|包含答案|详尽解析|分步解答/.test(clause)) return 'ans:full';
+  if (/竖版|portrait/i.test(clause) && !/不要竖版/.test(clause)) return 'orient:portrait';
+  if (/横版|landscape|当成\s*ppt|作为\s*ppt|ppt\s*版式/i.test(clause)) return 'orient:landscape';
   return null;
 }
 
@@ -389,6 +400,28 @@ export function consolidateRequirementsPure(params: {
     }
   }
 
+  const resolvedOrientation = detectResolvedPageOrientation({
+    rawPrompt: rawUserPrompt,
+    directivesTexts: directives.map((d) => d.text),
+  });
+  if (resolvedOrientation === 'landscape') {
+    const alreadyHasExplicitLandscapeStyleRule = items.some(
+      (i) =>
+        i.status === 'active' &&
+        i.category === 'style_notation' &&
+        i.summary.includes('横版 A4')
+    );
+    if (!alreadyHasExplicitLandscapeStyleRule) {
+      items.push({
+        id: `req-${items.length + 1}`,
+        category: 'style_notation',
+        summary: '采用横版 A4 (297×210mm) 宽屏演示 PPT 级版式，字号与公式清晰舒展，按模块化演示节组织',
+        sourceLabel: '版式识别引擎',
+        status: 'active',
+      });
+    }
+  }
+
   const activeItems = items.filter((i) => i.status === 'active');
   const groupedBriefLines: string[] = [];
 
@@ -460,6 +493,10 @@ export function normalizeAdaptivePlanAndVolumes(params: {
   customRootFolder: string;
   rawUserPrompt: string;
   multiVolumeDetection: MultiVolumeIntentDetection;
+  colorTheme?: ColorPaletteTheme;
+  autoGenerateFigures?: boolean;
+  pageOrientation?: PageOrientationMode;
+  directives?: SupplementalDirective[];
 }): ExpandedPlan {
   const {
     rawParsed,
@@ -468,11 +505,27 @@ export function normalizeAdaptivePlanAndVolumes(params: {
     customRootFolder,
     rawUserPrompt,
     multiVolumeDetection,
+    colorTheme = 'academic_blue',
+    autoGenerateFigures = true,
+    pageOrientation = 'auto',
+    directives = [],
   } = params;
+
+  const resolvedOrientation = detectResolvedPageOrientation({
+    explicitOrientation: pageOrientation,
+    planOrientation:
+      rawParsed.pageOrientation === 'landscape' || rawParsed.pageOrientation === 'portrait'
+        ? rawParsed.pageOrientation
+        : undefined,
+    rawPrompt: rawUserPrompt,
+    directivesTexts: directives.map((d) => d.text),
+  });
 
   const singleCallTargetWords = SINGLE_CALL_TARGET_WORDS_BY_DEPTH[depth];
   const docTitle = String(rawParsed.documentTitle || '深度学术讲义与研究专篇');
-  const subtitle = String(rawParsed.subtitle || '基于 Gemini 4 Carbon 自适应极限工作流编纂');
+  const subtitle = String(
+    rawParsed.subtitle || '基于 Carbon 主模型按需协同多模型精编与彩色图文排版'
+  );
   const subjectCategory = String(rawParsed.subjectCategory || '综合学术研究');
   const courseCode = String(rawParsed.courseCode || 'CARBON-101');
   const suggestedFileName = normalizePdfFileName(
@@ -622,7 +675,7 @@ export function normalizeAdaptivePlanAndVolumes(params: {
   }));
   const volumeById = new Map(volumes.map((v) => [v.volumeId, v]));
 
-  // 3. Parse dynamic unbounded rounds (`batches`)
+  // 3. Parse dynamic unbounded quality-sized modules (`batches`)
   const rawBatches = Array.isArray(rawParsed.batches)
     ? (rawParsed.batches as Array<Record<string, unknown>>)
     : [];
@@ -637,13 +690,13 @@ export function normalizeAdaptivePlanAndVolumes(params: {
             volumes.find((v) => v.volumeIndex === requestedVolIdx) ||
             volumes[Math.min(volumes.length - 1, Math.floor((idx * volumes.length) / Math.max(1, rawBatches.length)))];
 
-          const targetWords = Math.max(
-            3500,
-            Number(b.targetWords) || singleCallTargetWords
+          const targetWords = clampModuleWordsToQualitySweetSpot(
+            Number(b.targetWords) || singleCallTargetWords,
+            depth
           );
           const estPages = Math.max(
-            4,
-            Number(b.estimatedPages) || Math.ceil(targetWords / 800)
+            3,
+            Math.min(10, Number(b.estimatedPages) || Math.ceil(targetWords / 780))
           );
 
           const defaultIncludeAns =
@@ -653,49 +706,112 @@ export function normalizeAdaptivePlanAndVolumes(params: {
                 ? false
                 : Boolean(b.includeAnswerKey ?? (mode === 'workbook'));
 
+          const batchTitle = String(b.title || `第 ${idx + 1} 模块精编单元`);
+          const batchScope = String(b.scopeSummary || matchedVol.scopeSummary);
+          const batchSections =
+            Array.isArray(b.sections) && b.sections.length > 0
+              ? b.sections.map(String)
+              : [`${matchedVol.volumeTitle} 核心内容展开`];
+
+          const routed = routeSpecialistModelForBatch({
+            batchIndex: idx + 1,
+            totalBatches: Math.max(rawBatches.length, volumes.length),
+            title: batchTitle,
+            scopeSummary: batchScope,
+            sections: batchSections,
+            mode,
+            volumeRole: matchedVol.role,
+            requestedModelId: b.assignedModelId ? String(b.assignedModelId) : undefined,
+            requestedRole: b.specialistRole ? String(b.specialistRole) : undefined,
+            requestedReason: b.dispatchReason ? String(b.dispatchReason) : undefined,
+          });
+
+          const visualFigures = normalizeModuleVisualFigures({
+            batchIndex: idx + 1,
+            title: batchTitle,
+            scopeSummary: batchScope,
+            sections: batchSections,
+            mode,
+            volumeRole: matchedVol.role,
+            colorTheme,
+            autoGenerateFigures,
+            rawVisualFigures: b.visualFigures,
+          });
+
           return {
             batchIndex: idx + 1,
-            title: String(b.title || `第 ${idx + 1} 轮极限生成模块`),
-            scopeSummary: String(b.scopeSummary || matchedVol.scopeSummary),
-            sections:
-              Array.isArray(b.sections) && b.sections.length > 0
-                ? b.sections.map(String)
-                : [`${matchedVol.volumeTitle} 核心内容展开`],
+            title: batchTitle,
+            scopeSummary: batchScope,
+            sections: batchSections,
             estimatedPages: estPages,
             targetWords,
             includeAnswerKey: defaultIncludeAns,
             volumeId: matchedVol.volumeId,
             volumeIndex: matchedVol.volumeIndex,
+            assignedModelId: routed.assignedModelId,
+            specialistRole: routed.specialistRole,
+            dispatchReason: routed.dispatchReason,
+            visualFigures,
           };
         })
       : [];
 
-  // Ensure EVERY volume has at least one dedicated round so no independent output file is ever empty!
+  // Ensure EVERY volume has at least one dedicated module so no independent output file is ever empty!
   for (const vol of volumes) {
     const hasBatchForVol = normalizedBatches.some((b) => b.volumeId === vol.volumeId);
     if (!hasBatchForVol) {
+      const nextIdx = normalizedBatches.length + 1;
+      const fallbackTitle = `${vol.volumeTitle} · 质量精编专轮`;
+      const fallbackScope =
+        vol.scopeSummary ||
+        (vol.role === 'solutions_manual'
+          ? '逐题完整撰写前序分册全部例题与练习题的严密分步解析、多解对比与评分标准'
+          : `完整编纂《${vol.volumeTitle}》核心定义、定理推导与典型例题`);
+      const fallbackSections =
+        vol.role === 'solutions_manual'
+          ? ['例题全解与推导细节', '分级习题逐题完整解答与评分采分点', '常见易错陷阱总结']
+          : ['核心概念与公理定义', '关键定理严密证明与直觉', '典型例题与进阶应用'];
+
+      const routed = routeSpecialistModelForBatch({
+        batchIndex: nextIdx,
+        totalBatches: Math.max(normalizedBatches.length + 1, volumes.length),
+        title: fallbackTitle,
+        scopeSummary: fallbackScope,
+        sections: fallbackSections,
+        mode,
+        volumeRole: vol.role,
+      });
+
+      const visualFigures = normalizeModuleVisualFigures({
+        batchIndex: nextIdx,
+        title: fallbackTitle,
+        scopeSummary: fallbackScope,
+        sections: fallbackSections,
+        mode,
+        volumeRole: vol.role,
+        colorTheme,
+        autoGenerateFigures,
+      });
+
       normalizedBatches.push({
-        batchIndex: normalizedBatches.length + 1,
-        title: `${vol.volumeTitle} · 满载编纂专轮`,
-        scopeSummary:
-          vol.scopeSummary ||
-          (vol.role === 'solutions_manual'
-            ? '逐题完整撰写前序分册全部例题与练习题的严密分步解析、多解对比与评分标准'
-            : `完整编纂《${vol.volumeTitle}》核心定义、定理推导与典型例题`),
-        sections:
-          vol.role === 'solutions_manual'
-            ? ['例题全解与推导细节', '分级习题逐题完整解答与评分采分点', '常见易错陷阱总结']
-            : ['核心概念与公理定义', '关键定理严密证明与直觉', '典型例题与进阶应用'],
-        estimatedPages: Math.ceil(singleCallTargetWords / 800),
+        batchIndex: nextIdx,
+        title: fallbackTitle,
+        scopeSummary: fallbackScope,
+        sections: fallbackSections,
+        estimatedPages: Math.ceil(singleCallTargetWords / 780),
         targetWords: singleCallTargetWords,
         includeAnswerKey: vol.role === 'solutions_manual' || mode === 'workbook',
         volumeId: vol.volumeId,
         volumeIndex: vol.volumeIndex,
+        assignedModelId: routed.assignedModelId,
+        specialistRole: routed.specialistRole,
+        dispatchReason: routed.dispatchReason,
+        visualFigures,
       });
     }
   }
 
-  // Sort batches by volumeIndex ascending so Volume 1 completes cleanly before Volume 2 (especially vital when Volume 2 is Solutions Manual for Volume 1!)
+  // Sort batches by volumeIndex ascending so Volume 1 completes cleanly before Volume 2
   normalizedBatches = normalizedBatches
     .sort((a, b) => (a.volumeIndex || 1) - (b.volumeIndex || 1) || a.batchIndex - b.batchIndex)
     .map((b, idx) => ({
@@ -703,12 +819,29 @@ export function normalizeAdaptivePlanAndVolumes(params: {
       batchIndex: idx + 1,
     }));
 
+  const uniqueDispatchedModels = Array.from(
+    new Set(normalizedBatches.map((b) => getToolModelEntry(b.assignedModelId).codeName))
+  );
+  const totalPlannedFigures = normalizedBatches.reduce(
+    (sum, b) => sum + (b.visualFigures?.length || 0),
+    0
+  );
+  if (totalPlannedFigures > 0) {
+    uniqueDispatchedModels.push('Nano Banana');
+  }
+
   const isMultiVolume = volumes.length > 1;
+  const multiModelDispatchSummary =
+    String(rawParsed.multiModelDispatchSummary || '').trim() ||
+    `由主思考模型 Carbon 统筹拆解为 ${normalizedBatches.length} 个适度体量高质模块（单次目标 ~${singleCallTargetWords.toLocaleString()} 字，拒绝盲目撑满极限），按需协同调用 ${uniqueDispatchedModels.join(' · ')} 分工撰写证明、题组演算、填色知识框${
+      totalPlannedFigures > 0 ? `与 ${totalPlannedFigures} 幅学术配图` : ''
+    }，最后无缝拼接合编`;
+
   const adaptiveStrategyNote =
     String(rawParsed.adaptiveStrategyNote || '').trim() ||
     (isMultiVolume
-      ? `自适应拆分为 ${volumes.length} 份独立 PDF 分册，共编排 ${normalizedBatches.length} 轮单次调用满载生成（每轮目标 ~${singleCallTargetWords.toLocaleString()} 字）`
-      : `单次调用极限自适应排程：按内容真实体量动态拆分为 ${normalizedBatches.length} 轮满载生成（每轮目标 ~${singleCallTargetWords.toLocaleString()} 字，无固定轮次上限）`);
+      ? `自适应拆分为 ${volumes.length} 份独立 PDF 分册 · 共 ${normalizedBatches.length} 个质量优先精编模块（每模块目标 ~${singleCallTargetWords.toLocaleString()} 字）· ${multiModelDispatchSummary}`
+      : multiModelDispatchSummary);
 
   return {
     documentTitle: docTitle,
@@ -726,8 +859,200 @@ export function normalizeAdaptivePlanAndVolumes(params: {
     volumes,
     singleCallTargetWords,
     adaptiveStrategyNote,
+    colorTheme,
+    pageOrientation: resolvedOrientation,
+    autoGenerateFigures,
+    multiModelDispatchSummary,
     batches: normalizedBatches,
   };
+}
+
+/**
+ * Deterministic Zero-Pause Plan Synthesizer:
+ * Guarantees that even if all upstream structured-JSON planning calls experience
+ * network turbulence or schema truncation, the pipeline NEVER stalls in `planning` —
+ * it immediately synthesizes a valid, domain-structured `ExpandedPlan` honoring
+ * multi-volume splits, page orientation, color theme, and specialist model routing.
+ */
+export function buildDeterministicFallbackPlan(params: {
+  mode: DocMode;
+  depth: DepthPreset;
+  customRootFolder: string;
+  rawUserPrompt: string;
+  consolidatedMasterBrief?: string;
+  multiVolumeDetection: MultiVolumeIntentDetection;
+  colorTheme?: ColorPaletteTheme;
+  autoGenerateFigures?: boolean;
+  pageOrientation?: PageOrientationMode;
+  directives?: SupplementalDirective[];
+  referenceJobTitle?: string;
+}): ExpandedPlan {
+  const {
+    mode,
+    depth,
+    customRootFolder,
+    rawUserPrompt,
+    consolidatedMasterBrief,
+    multiVolumeDetection,
+    colorTheme = 'academic_blue',
+    autoGenerateFigures = true,
+    pageOrientation = 'auto',
+    directives = [],
+    referenceJobTitle,
+  } = params;
+
+  const cleanTopic = (rawUserPrompt || referenceJobTitle || '核心学术专题')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const shortTitleSeed =
+    referenceJobTitle ||
+    cleanTopic.split(/[，,。；;！!\n]/)[0]?.slice(0, 32) ||
+    (mode === 'workbook' ? '分级学术精编练习题册' : '深度学术课程讲义');
+
+  const docTitle = shortTitleSeed.includes('讲义') || shortTitleSeed.includes('题册')
+    ? shortTitleSeed
+    : `${shortTitleSeed}${mode === 'workbook' ? ' · 精编练习题册' : ' · 深度课程讲义'}`;
+
+  const singleCallWords = SINGLE_CALL_TARGET_WORDS_BY_DEPTH[depth];
+
+  const defaultBatchesRaw: Array<Record<string, unknown>> = [];
+  if (multiVolumeDetection.shouldSplitVolumes) {
+    if (
+      multiVolumeDetection.splitPattern === 'by_chapter_modules' &&
+      multiVolumeDetection.detectedModules.length >= 2
+    ) {
+      multiVolumeDetection.detectedModules.forEach((modName, idx) => {
+        defaultBatchesRaw.push({
+          batchIndex: defaultBatchesRaw.length + 1,
+          volumeId: `vol-${idx + 1}`,
+          volumeIndex: idx + 1,
+          title: `第 ${idx + 1} 分册核心模块：${modName} 理论体系与典型例题`,
+          scopeSummary: `完整展开「${modName}」的核心定义、定理严密证明、彩色总结框与典型例题`,
+          sections: [
+            `${modName}：核心概念与公理定义`,
+            `${modName}：关键定理推导与直观图解`,
+            `${modName}：典型例题与进阶训练`,
+          ],
+          estimatedPages: 6,
+          targetWords: singleCallWords,
+          includeAnswerKey: !multiVolumeDetection.hasSeparateSolutions && mode === 'workbook',
+        });
+      });
+      if (multiVolumeDetection.hasSeparateSolutions) {
+        const solVolIdx = multiVolumeDetection.detectedModules.length + 1;
+        defaultBatchesRaw.push({
+          batchIndex: defaultBatchesRaw.length + 1,
+          volumeId: `vol-${solVolIdx}`,
+          volumeIndex: solVolIdx,
+          title: `第 ${solVolIdx} 分册：全册例题与训练题完整答案详解`,
+          scopeSummary: '严格对应前序各分册例题与训练题编号，输出无跳步分步解析与采分标准',
+          sections: ['各章典型例题完整推导', '配套训练题逐题分步解答与评分标准', '高频易错陷阱辨析'],
+          estimatedPages: 6,
+          targetWords: singleCallWords,
+          includeAnswerKey: true,
+        });
+      }
+    } else if (multiVolumeDetection.hasSeparateSolutions) {
+      defaultBatchesRaw.push(
+        {
+          batchIndex: 1,
+          volumeId: 'vol-1',
+          volumeIndex: 1,
+          title: '第 1 分册（上）：基础理论体系、核心定理与初级训练题干',
+          scopeSummary: '系统构建核心概念定义、关键定理证明与基础/进阶精选题干（答案独立成册）',
+          sections: ['核心公理与定义体系', '基础定理证明与几何直觉', '第一阶段分级训练题干'],
+          estimatedPages: 6,
+          targetWords: singleCallWords,
+          includeAnswerKey: false,
+        },
+        {
+          batchIndex: 2,
+          volumeId: 'vol-1',
+          volumeIndex: 1,
+          title: '第 1 分册（下）：综合进阶专题、跨章建模与压轴题干',
+          scopeSummary: '深入高阶综合方法论、结构化对比表与压轴证明/计算题干（答案独立成册）',
+          sections: ['高阶专题与综合建模方法', '多维方法对比与易错警示', '第二阶段综合压轴题干'],
+          estimatedPages: 6,
+          targetWords: singleCallWords,
+          includeAnswerKey: false,
+        },
+        {
+          batchIndex: 3,
+          volumeId: 'vol-2',
+          volumeIndex: 2,
+          title: '第 2 分册：全册例题与分级训练题完整答案与评分标准',
+          scopeSummary: '严格逐题对应第 1 分册编号，给出完整分步演算、多解对比与采分细则',
+          sections: ['第一阶段训练题逐题详解与采分点', '第二阶段综合压轴题严密证明与评分标准'],
+          estimatedPages: 7,
+          targetWords: singleCallWords,
+          includeAnswerKey: true,
+        }
+      );
+    }
+  }
+
+  if (defaultBatchesRaw.length === 0) {
+    const moduleCount = depth === 'standard' ? 2 : depth === 'comprehensive' ? 3 : 4;
+    const presetTitles =
+      mode === 'workbook'
+        ? [
+            '第一模块：核心概念辨析与基础巩固题组（含详解）',
+            '第二模块：重点方法演练与中档计算推导题组（含详解）',
+            '第三模块：跨章节综合应用与高阶建模题组（含详解）',
+            '第四模块：竞赛/研考级压轴证明题与全局易错复盘',
+          ]
+        : [
+            '第一模块：学科动机、核心定义体系与基础性质推导',
+            '第二模块：主干定理严密证明、几何/物理直觉与典型算例',
+            '第三模块：高阶专题拓展、算法/工程建模与综合例题',
+            '第四模块：前沿综合压轴剖析、易错辨析与全局速查总表',
+          ];
+
+    for (let idx = 0; idx < moduleCount; idx++) {
+      defaultBatchesRaw.push({
+        batchIndex: idx + 1,
+        volumeId: 'vol-1',
+        volumeIndex: 1,
+        title: presetTitles[idx] || `第 ${idx + 1} 模块精编单元`,
+        scopeSummary: `围绕「${cleanTopic.slice(0, 120)}」展开第 ${idx + 1}/${moduleCount} 阶段无跳步精编`,
+        sections: [
+          `${idx + 1}.1 核心理论与结构化要点`,
+          `${idx + 1}.2 严密推导与彩色知识框解析`,
+          `${idx + 1}.3 典型例题与巩固小结`,
+        ],
+        estimatedPages: 6,
+        targetWords: singleCallWords,
+        includeAnswerKey: mode === 'workbook',
+      });
+    }
+  }
+
+  return normalizeAdaptivePlanAndVolumes({
+    rawParsed: {
+      documentTitle: docTitle,
+      subtitle: '多模型自适应协同精编与出版级排版',
+      subjectCategory: '综合学术研究',
+      courseCode: 'CARBON-201',
+      suggestedFileName: `${docTitle}.pdf`,
+      expandedPrompt: consolidatedMasterBrief || rawUserPrompt,
+      pedagogicalGoals: [
+        '建立严密清晰的概念、定义与符号体系',
+        '提供无跳步的定理推导、典型例题演算与评分标准',
+        '输出可直接用于课堂讲授、自测或演示的高可读性排版文档',
+      ],
+      batches: defaultBatchesRaw,
+    },
+    mode,
+    depth,
+    customRootFolder,
+    rawUserPrompt,
+    multiVolumeDetection,
+    colorTheme,
+    autoGenerateFigures,
+    pageOrientation,
+    directives,
+  });
 }
 
 /**
@@ -759,10 +1084,13 @@ export function computeVolumeArtifactsFromBatches(params: {
       return resolvedVolId === volId;
     });
 
-    const volMarkdown = matchingBatches
-      .map((b) => b.markdownContent.trim())
-      .filter(Boolean)
-      .join('\n\n');
+    const volMarkdown = stitchModularSectionsIntoDocument({
+      modules: matchingBatches.map((b) => ({
+        batchIndex: b.batchIndex,
+        markdownContent: b.markdownContent,
+        generatedFigures: b.generatedFigures,
+      })),
+    });
 
     const metrics = countAcademicMetrics(volMarkdown);
     const allDone =

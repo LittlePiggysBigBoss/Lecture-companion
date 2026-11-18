@@ -1,20 +1,23 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { GenerateContentResponse } from '@google/genai';
 import type {
   AttachmentKind,
   AttachmentSummary,
   BatchExecutionState,
+  ColorPaletteTheme,
   DepthPreset,
   DocMode,
   ExpandedPlan,
+  GeneratedFigureAsset,
   GeneratedVolumeArtifact,
   JobBillingSnapshot,
+  ModelUsageStat,
   OutputVolumeSpec,
+  PageOrientationMode,
   PipelineJob,
   PostCompletionExpansionMode,
   ResumeStrategy,
@@ -25,6 +28,15 @@ import type {
   VolumeSplitMode,
 } from '../types.ts';
 import { renderAcademicMarkdown } from '../utils/markdownMathRenderer.ts';
+import {
+  clampModuleWordsToQualitySweetSpot,
+  computeMultiModelTokenCostSavingsPct,
+  getToolModelEntry,
+  injectGeneratedFiguresIntoModuleMarkdown,
+  resolveColorPaletteSpec,
+  routeSpecialistModelForBatch,
+  stitchModularSectionsIntoDocument,
+} from '../utils/modelRegistryAndRouter.ts';
 import {
   BATCH_COMPLETE_MARKER,
   buildDriveArchivePath,
@@ -43,6 +55,7 @@ import {
   windowLongMarkdownContext,
 } from '../utils/linkAndMemoryLogic.ts';
 import {
+  buildDeterministicFallbackPlan,
   buildTokenEfficientExecutionContext,
   computeVolumeArtifactsFromBatches,
   consolidateRequirementsPure,
@@ -60,8 +73,15 @@ import {
 } from './accountAndBillingStore.ts';
 import { scanAndIngestLinksFromInput } from './linkScannerService.ts';
 import { resolveStoredFileToGeminiPart } from './unlimitedFileStore.ts';
-
-const execFileAsync = promisify(execFile);
+import {
+  computeHeadlessPdfTimeoutMs,
+  detectResolvedPageOrientation,
+  isRecoverablePipelineError,
+  isValidPdfBuffer,
+  rewriteKatexCssLocalFonts,
+  shouldCompileMergedFullPdfInWorker,
+  shouldUseRemoteGoogleFontsInPdf,
+} from '../utils/pdfServerHelpers.ts';
 
 export const CARBON_MODEL = 'gemini-4-carbon';
 const SNAPSHOT_FOLDER_NAME = '_云端任务快照 (Task Snapshots)';
@@ -81,10 +101,30 @@ const DATA_DIR = path.resolve(process.cwd(), '.carbon-jobs');
 const JOBS_FILE = path.join(DATA_DIR, 'jobs.json');
 const PDF_CACHE_DIR = path.join(DATA_DIR, 'pdfs');
 const ATT_CACHE_DIR = path.join(DATA_DIR, 'attachments');
+const MEDIA_CACHE_DIR = path.join(DATA_DIR, 'media');
 
 function ensureStorageDirs(): void {
   fs.mkdirSync(PDF_CACHE_DIR, { recursive: true });
   fs.mkdirSync(ATT_CACHE_DIR, { recursive: true });
+  fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
+}
+
+export function getJobMediaFile(
+  jobId: string,
+  fileName: string
+): { filePath: string; mimeType: string } | null {
+  const safeJobId = path.basename(jobId);
+  const safeFile = path.basename(fileName);
+  const fullPath = path.join(MEDIA_CACHE_DIR, safeJobId, safeFile);
+  if (!fs.existsSync(fullPath)) return null;
+  const ext = path.extname(safeFile).toLowerCase();
+  const mimeType =
+    ext === '.jpg' || ext === '.jpeg'
+      ? 'image/jpeg'
+      : ext === '.webp'
+        ? 'image/webp'
+        : 'image/png';
+  return { filePath: fullPath, mimeType };
 }
 
 // In-memory server state (persisted to .carbon-jobs/jobs.json and mirrored to each user's Google Cloud)
@@ -109,7 +149,88 @@ function persistJobsToDisk(): void {
   }
 }
 
+const MAX_AUTO_HEAL_WATCHDOG_CYCLES = 6;
+let autonomousWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+function startAutonomousPipelineWatchdog(): void {
+  if (autonomousWatchdogTimer) return;
+  autonomousWatchdogTimer = setInterval(() => {
+    const now = Date.now();
+    for (const job of jobsMap.values()) {
+      // Never auto-resume jobs explicitly paused/cancelled by the user or already completed
+      if (job.stage === 'cancelled' || job.stage === 'completed') {
+        continue;
+      }
+
+      const healCount = job.autoHealWatchdogCount || 0;
+      if (healCount >= MAX_AUTO_HEAL_WATCHDOG_CYCLES) {
+        continue;
+      }
+
+      const lastBeatMs = Date.parse(job.lastHeartbeatAt || job.updatedAt || job.createdAt) || 0;
+      const idleMs = now - lastBeatMs;
+
+      // Case 1: Job is marked active (`planning` / `executing` / `compiling_pdf` / `uploading_drive`),
+      //         either orphaned without an active controller OR stalled past its heartbeat budget
+      if (isJobActiveStage(job.stage)) {
+        const hasController = activeControllers.has(job.id);
+        const stallBudgetMs = job.stage === 'compiling_pdf' ? 240_000 : 140_000;
+        if ((!hasController && idleMs > 6_000) || (hasController && idleMs > stallBudgetMs)) {
+          const oldCtrl = activeControllers.get(job.id);
+          if (oldCtrl) {
+            activeControllers.delete(job.id);
+            oldCtrl.abort();
+          }
+          const bumped: PipelineJob = {
+            ...job,
+            autoHealWatchdogCount: healCount + 1,
+            autoRecoveryCount: (job.autoRecoveryCount || 0) + 1,
+            lastHeartbeatAt: new Date().toISOString(),
+          };
+          jobsMap.set(job.id, bumped);
+          console.log(
+            `[Autonomous Watchdog] Self-healing stalled ${job.stage} job ${job.id} (idle ${Math.round(idleMs / 1000)}s, cycle #${healCount + 1})`
+          );
+          resumeDetachedJob({
+            incomingJob: bumped,
+            strategy: 'continue',
+            ownerEmail: bumped.ownerEmail,
+          });
+        }
+        continue;
+      }
+
+      // Case 2: Job hit a recoverable `error` (transient network/API hiccup, stream reset, or KaTeX/PDF glitch)
+      //         -> Automatically self-heal from exact checkpoint without waiting for manual user clicks!
+      if (
+        job.stage === 'error' &&
+        !activeControllers.has(job.id) &&
+        idleMs >= 10_000 &&
+        isRecoverablePipelineError(job.errorMessage)
+      ) {
+        const bumped: PipelineJob = {
+          ...job,
+          autoHealWatchdogCount: healCount + 1,
+          autoRecoveryCount: (job.autoRecoveryCount || 0) + 1,
+          lastHeartbeatAt: new Date().toISOString(),
+        };
+        jobsMap.set(job.id, bumped);
+        console.log(
+          `[Autonomous Watchdog] Auto-recovering error job ${job.id} (${job.failedStage || 'unknown'}): ${job.errorMessage?.slice(0, 80)}`
+        );
+        resumeDetachedJob({
+          incomingJob: bumped,
+          strategy: 'continue',
+          ownerEmail: bumped.ownerEmail,
+        });
+      }
+    }
+  }, 15_000);
+  autonomousWatchdogTimer.unref?.();
+}
+
 export function loadJobsFromDisk(): void {
+  startAutonomousPipelineWatchdog();
   try {
     ensureStorageDirs();
     if (!fs.existsSync(JOBS_FILE)) return;
@@ -126,6 +247,10 @@ export function loadJobsFromDisk(): void {
       const hadActiveBatch = item.batches?.some(
         (b) => b.status === 'running' || b.status === 'continuing'
       );
+      const isRecoverableErr =
+        item.stage === 'error' &&
+        isRecoverablePipelineError(item.errorMessage) &&
+        (item.autoHealWatchdogCount || 0) < MAX_AUTO_HEAL_WATCHDOG_CYCLES;
 
       const hydrated: PipelineJob = {
         ...item,
@@ -133,9 +258,21 @@ export function loadJobsFromDisk(): void {
       };
       jobsMap.set(hydrated.id, hydrated);
 
-      // Seamless Zero-Interruption Upgrade: auto-resume any active/mid-stream job on server boot!
-      if (isJobActiveStage(hydrated.stage) || (hydrated.stage !== 'completed' && hadActiveBatch)) {
-        jobsToAutoResume.push(hydrated);
+      // Seamless Zero-Interruption Upgrade & Auto-Heal: resume active OR recoverable error jobs on server boot!
+      if (
+        isJobActiveStage(hydrated.stage) ||
+        (hydrated.stage !== 'completed' && hydrated.stage !== 'cancelled' && hadActiveBatch) ||
+        isRecoverableErr
+      ) {
+        jobsToAutoResume.push(
+          isRecoverableErr
+            ? {
+                ...hydrated,
+                autoHealWatchdogCount: (hydrated.autoHealWatchdogCount || 0) + 1,
+                autoRecoveryCount: (hydrated.autoRecoveryCount || 0) + 1,
+              }
+            : hydrated
+        );
       }
     }
 
@@ -145,7 +282,9 @@ export function loadJobsFromDisk(): void {
       setTimeout(() => {
         for (const activeItem of jobsToAutoResume) {
           if (!activeControllers.has(activeItem.id)) {
-            console.log(`[Zero-Interruption Boot] Auto-resuming active cloud job: ${activeItem.id}`);
+            console.log(
+              `[Zero-Pause Autonomous Boot] Resuming/healing cloud job: ${activeItem.id} (prev stage: ${activeItem.stage})`
+            );
             resumeDetachedJob({
               incomingJob: activeItem,
               strategy: 'continue',
@@ -318,6 +457,10 @@ export function deleteServerJob(jobId: string): void {
     }
     const attPath = path.join(ATT_CACHE_DIR, `${jobId}.json`);
     if (fs.existsSync(attPath)) fs.unlinkSync(attPath);
+    const jobMediaDir = path.join(MEDIA_CACHE_DIR, path.basename(jobId));
+    if (fs.existsSync(jobMediaDir)) {
+      fs.rmSync(jobMediaDir, { recursive: true, force: true });
+    }
   } catch {
     // Ignore
   }
@@ -349,7 +492,11 @@ function updateJobState(
 ): PipelineJob | null {
   const current = jobsMap.get(jobId);
   if (!current) return null;
-  const next = updater(current);
+  const rawNext = updater(current);
+  const next: PipelineJob = {
+    ...rawNext,
+    lastHeartbeatAt: new Date().toISOString(),
+  };
   jobsMap.set(jobId, next);
   if (flushDisk) {
     persistJobsToDisk();
@@ -357,13 +504,20 @@ function updateJobState(
   return next;
 }
 
-function addMeasuredUsageToJob(jobId: string, response: GenerateContentResponse): void {
+function addMeasuredUsageToJob(
+  jobId: string,
+  response: GenerateContentResponse,
+  modelIdUsed = CARBON_MODEL,
+  roleSummary?: string,
+  generatedImagesDelta = 0
+): void {
   const meta = response.usageMetadata;
-  if (!meta) return;
-  const inTok = Number(meta.promptTokenCount || 0);
+  const inTok = Number(meta?.promptTokenCount || 0);
   const outTok =
-    Number(meta.candidatesTokenCount || 0) + Number(meta.thoughtsTokenCount || 0);
-  if (inTok <= 0 && outTok <= 0) return;
+    Number(meta?.candidatesTokenCount || 0) + Number(meta?.thoughtsTokenCount || 0);
+  if (inTok <= 0 && outTok <= 0 && generatedImagesDelta <= 0) return;
+
+  const modelEntry = getToolModelEntry(modelIdUsed);
 
   updateJobState(
     jobId,
@@ -378,8 +532,36 @@ function addMeasuredUsageToJob(jobId: string, response: GenerateContentResponse)
       };
       const nextIn = (prevBilling.actualInputTokens || 0) + inTok;
       const nextOut = (prevBilling.actualOutputTokens || 0) + outTok;
+
+      const existingBreakdown: ModelUsageStat[] = [...(prev.modelUsageBreakdown || [])];
+      const existingIdx = existingBreakdown.findIndex((m) => m.modelId === modelIdUsed);
+      if (existingIdx >= 0) {
+        const cur = existingBreakdown[existingIdx];
+        existingBreakdown[existingIdx] = {
+          ...cur,
+          calls: cur.calls + 1,
+          inputTokens: cur.inputTokens + inTok,
+          outputTokens: cur.outputTokens + outTok,
+          generatedImages: (cur.generatedImages || 0) + generatedImagesDelta,
+        };
+      } else {
+        existingBreakdown.push({
+          modelId: modelIdUsed,
+          codeName: modelEntry.codeName,
+          calls: 1,
+          inputTokens: inTok,
+          outputTokens: outTok,
+          generatedImages: generatedImagesDelta > 0 ? generatedImagesDelta : undefined,
+          roleSummary: roleSummary || modelEntry.workflowStages[0] || modelEntry.bestForSummary,
+        });
+      }
+
+      const savingsPct = computeMultiModelTokenCostSavingsPct(existingBreakdown);
+
       return {
         ...prev,
+        modelUsageBreakdown: existingBreakdown,
+        multiModelTokenCostSavingsPct: savingsPct,
         billing: {
           ...prevBilling,
           actualInputTokens: nextIn,
@@ -1053,20 +1235,44 @@ function escapeHtmlServer(str: string): string {
     .replaceAll('"', '&quot;');
 }
 
+function inlineLocalJobMediaForPdf(jobId: string, html: string): string {
+  return html.replace(
+    /\/api\/jobs\/([^/"'\s]+)\/media\/([^"'\s>?]+)/g,
+    (fullMatch, rawJobId, rawFile) => {
+      try {
+        const decodedJobId = decodeURIComponent(String(rawJobId || jobId));
+        const decodedFile = decodeURIComponent(String(rawFile));
+        const resolved = getJobMediaFile(decodedJobId, decodedFile);
+        if (!resolved) return fullMatch;
+        const buf = fs.readFileSync(resolved.filePath);
+        return `data:${resolved.mimeType};base64,${buf.toString('base64')}`;
+      } catch {
+        return fullMatch;
+      }
+    }
+  );
+}
+
 function buildStandaloneAcademicHtml(
   job: PipelineJob,
-  targetVolume?: GeneratedVolumeArtifact
+  targetVolume?: GeneratedVolumeArtifact,
+  forceOfflineFonts = false
 ): string {
   let katexCss = '';
   try {
     const katexCssPath = path.resolve(process.cwd(), 'node_modules/katex/dist/katex.min.css');
+    const katexFontsDir = path.resolve(process.cwd(), 'node_modules/katex/dist/fonts');
     if (fs.existsSync(katexCssPath)) {
-      katexCss = fs.readFileSync(katexCssPath, 'utf-8');
+      const rawCss = fs.readFileSync(katexCssPath, 'utf-8');
+      katexCss = rewriteKatexCssLocalFonts(rawCss, katexFontsDir);
     }
   } catch {
     // Ignore
   }
 
+  const colorTheme: ColorPaletteTheme =
+    job.colorTheme || job.plan?.colorTheme || 'academic_blue';
+  const palette = resolveColorPaletteSpec(colorTheme);
   const totalVolumes = job.outputVolumes?.length || job.plan?.volumes?.length || 1;
   const title = targetVolume?.volumeTitle || job.plan?.documentTitle || '学术课程讲义';
   const subtitle = targetVolume?.subtitle || job.plan?.subtitle || '';
@@ -1084,72 +1290,89 @@ function buildStandaloneAcademicHtml(
       : baseModeLabel;
   const dateStr = new Date(job.createdAt).toLocaleDateString('zh-CN');
   const rawMd = targetVolume ? targetVolume.compiledMarkdown : job.compiledMarkdown;
-  const bodyHtml = renderAcademicMarkdown(rawMd);
+  const useRemoteFonts = shouldUseRemoteGoogleFontsInPdf(rawMd.length, forceOfflineFonts);
+  const googleFontsLink = useRemoteFonts
+    ? '<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet" />'
+    : '';
+  const resolvedOrientation = detectResolvedPageOrientation({
+    explicitOrientation: job.pageOrientation,
+    planOrientation: job.plan?.pageOrientation,
+    rawPrompt: job.rawUserPrompt,
+    directivesTexts: (job.supplementalDirectives || []).map((d) => d.text),
+  });
+  const isLandscape = resolvedOrientation === 'landscape';
+
+  const bodyHtml = inlineLocalJobMediaForPdf(
+    job.id,
+    renderAcademicMarkdown(rawMd, colorTheme)
+  );
 
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <title>${escapeHtmlServer(title)}</title>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet" />
+  ${googleFontsLink}
   <style>
     ${katexCss}
     @page {
-      size: A4 portrait;
-      margin: 18mm 16mm 18mm 16mm;
+      size: A4 ${resolvedOrientation};
+      margin: ${isLandscape ? '13mm 16mm 13mm 16mm' : '18mm 16mm 18mm 16mm'};
     }
     body {
-      font-family: "Plus Jakarta Sans", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: "Plus Jakarta Sans", "Noto Sans SC", "Liberation Sans", "DejaVu Sans", "Unifont", -apple-system, BlinkMacSystemFont, sans-serif;
       color: #0f172a;
       background: #ffffff;
-      font-size: 13.5px;
-      line-height: 1.72;
+      font-size: ${isLandscape ? '15px' : '13.5px'};
+      line-height: ${isLandscape ? '1.68' : '1.72'};
       margin: 0;
       padding: 0;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
     }
     .cover-box {
-      padding: 16px 20px;
+      padding: ${isLandscape ? '18px 24px' : '16px 20px'};
       margin-bottom: 22px;
-      background-color: #f8fafc;
-      border: 1px solid #cbd5e1;
+      background-color: ${palette.coverBgHex};
+      border: 1px solid ${palette.coverBorderHex};
       border-radius: 8px;
     }
     .cover-meta {
-      font-size: 11px;
-      color: #475569;
+      font-size: ${isLandscape ? '12px' : '11px'};
+      color: ${palette.accentHex};
       margin-bottom: 6px;
-      font-weight: 500;
+      font-weight: 600;
     }
     .cover-title {
-      font-size: 22px;
+      font-size: ${isLandscape ? '24px' : '22px'};
       font-weight: 700;
-      color: #0f172a;
+      color: ${palette.coverTitleHex};
       line-height: 1.32;
       margin-bottom: 6px;
     }
     .cover-sub {
-      font-size: 13px;
+      font-size: ${isLandscape ? '14px' : '13px'};
       color: #475569;
       line-height: 1.5;
     }
     h1 {
-      font-size: 20px;
+      font-size: ${isLandscape ? '21.5px' : '20px'};
       font-weight: 700;
       margin-top: 24px;
       margin-bottom: 10px;
       padding-bottom: 6px;
-      border-bottom: 1px solid #e2e8f0;
+      border-bottom: 1px solid ${palette.h1BorderHex};
       page-break-after: avoid;
     }
     h2 {
-      font-size: 16.5px;
+      font-size: ${isLandscape ? '18px' : '16.5px'};
       font-weight: 700;
       margin-top: 20px;
       margin-bottom: 8px;
       page-break-after: avoid;
     }
     h3 {
-      font-size: 14.5px;
+      font-size: ${isLandscape ? '15.5px' : '14.5px'};
       font-weight: 600;
       margin-top: 16px;
       margin-bottom: 6px;
@@ -1187,7 +1410,17 @@ function buildStandaloneAcademicHtml(
       padding: 7px 9px;
       text-align: left;
     }
-    th { background: #f8fafc; font-weight: 600; }
+    th {
+      background: ${palette.tableHeaderBgHex};
+      color: ${palette.tableHeaderTextHex};
+      font-weight: 600;
+    }
+    img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 0 auto;
+    }
     .katex-display {
       margin: 12px 0;
       padding: 8px 10px;
@@ -1209,6 +1442,68 @@ function buildStandaloneAcademicHtml(
 </html>`;
 }
 
+function runHeadlessChromiumPrintToPdf(params: {
+  chromiumBin: string;
+  tmpHtml: string;
+  tmpPdf: string;
+  timeoutMs: number;
+}): Promise<{ ok: boolean; timedOut: boolean; exitCode: number | null }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+
+    const child = spawn(
+      params.chromiumBin,
+      [
+        '--headless',
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-default-apps',
+        '--mute-audio',
+        '--no-first-run',
+        '--log-level=3',
+        '--no-pdf-header-footer',
+        `--print-to-pdf=${params.tmpPdf}`,
+        `file://${params.tmpHtml}`,
+      ],
+      {
+        // Isolate child stdio completely so container DBus / inotify / netlink chatter
+        // never stalls pipe buffers or pollutes server error logs.
+        stdio: ['ignore', 'ignore', 'ignore'],
+        env: {
+          ...process.env,
+          DBUS_SESSION_BUS_ADDRESS: 'disabled:',
+          DBUS_SYSTEM_BUS_ADDRESS: 'disabled:',
+        },
+      }
+    );
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Ignore
+      }
+    }, params.timeoutMs);
+
+    const finish = (ok: boolean, exitCode: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok, timedOut, exitCode });
+    };
+
+    child.on('error', () => finish(false, null));
+    child.on('close', (code) => finish(code === 0, code));
+  });
+}
+
 async function compileServerPdfBuffer(
   job: PipelineJob,
   driveToken: string | null,
@@ -1216,47 +1511,60 @@ async function compileServerPdfBuffer(
   targetVolume?: GeneratedVolumeArtifact
 ): Promise<Buffer | null> {
   ensureStorageDirs();
-  const html = buildStandaloneAcademicHtml(job, targetVolume);
   const cacheFileName = buildPdfCacheFileName(job.id, targetVolume?.volumeId);
   const chromiumBin = findHeadlessChromiumBinary();
+  const rawMd = targetVolume ? targetVolume.compiledMarkdown : job.compiledMarkdown;
 
   if (chromiumBin) {
-    const uniqueSuffix = `${job.id}_${targetVolume?.volumeId || 'full'}_${Date.now()}`;
-    const tmpHtml = path.join(os.tmpdir(), `carbon_${uniqueSuffix}.html`);
-    const tmpPdf = path.join(os.tmpdir(), `carbon_${uniqueSuffix}.pdf`);
-    try {
-      fs.writeFileSync(tmpHtml, html, 'utf-8');
-      await execFileAsync(
-        chromiumBin,
-        [
-          '--headless',
-          '--no-sandbox',
-          '--disable-gpu',
-          '--disable-dev-shm-usage',
-          '--no-pdf-header-footer',
-          `--print-to-pdf=${tmpPdf}`,
-          `file://${tmpHtml}`,
-        ],
-        { timeout: 55000 }
-      );
-      if (fs.existsSync(tmpPdf)) {
-        const pdfBuf = fs.readFileSync(tmpPdf);
-        if (persistLocalCache) {
-          fs.writeFileSync(path.join(PDF_CACHE_DIR, cacheFileName), pdfBuf);
-        }
-        return pdfBuf;
-      }
-    } catch (err) {
-      console.warn('Headless Chromium PDF print fallback triggered:', err);
-    } finally {
+    // Attempt 1 uses remote Google Fonts when document size is moderate; if it times out or
+    // encounters a network stall, Attempt 2 retries automatically in pure offline font mode.
+    const canRetryOffline = shouldUseRemoteGoogleFontsInPdf(rawMd.length, false);
+    const attempts = canRetryOffline ? [false, true] : [true];
+
+    for (const forceOffline of attempts) {
+      const html = buildStandaloneAcademicHtml(job, targetVolume, forceOffline);
+      const htmlBytes = Buffer.byteLength(html, 'utf-8');
+      const timeoutMs = computeHeadlessPdfTimeoutMs(htmlBytes);
+      const uniqueSuffix = `${job.id}_${targetVolume?.volumeId || 'full'}_${Date.now()}`;
+      const tmpHtml = path.join(os.tmpdir(), `carbon_${uniqueSuffix}.html`);
+      const tmpPdf = path.join(os.tmpdir(), `carbon_${uniqueSuffix}.pdf`);
+
       try {
-        if (fs.existsSync(tmpHtml)) fs.unlinkSync(tmpHtml);
-        if (fs.existsSync(tmpPdf)) fs.unlinkSync(tmpPdf);
+        fs.writeFileSync(tmpHtml, html, 'utf-8');
+        await runHeadlessChromiumPrintToPdf({
+          chromiumBin,
+          tmpHtml,
+          tmpPdf,
+          timeoutMs,
+        });
+
+        if (fs.existsSync(tmpPdf)) {
+          const pdfBuf = fs.readFileSync(tmpPdf);
+          if (isValidPdfBuffer(pdfBuf)) {
+            if (persistLocalCache) {
+              fs.writeFileSync(path.join(PDF_CACHE_DIR, cacheFileName), pdfBuf);
+            }
+            return pdfBuf;
+          }
+        }
       } catch {
-        // Ignore
+        // Proceed to offline retry or Drive export fallback cleanly
+      } finally {
+        try {
+          if (fs.existsSync(tmpHtml)) fs.unlinkSync(tmpHtml);
+          if (fs.existsSync(tmpPdf)) fs.unlinkSync(tmpPdf);
+        } catch {
+          // Ignore
+        }
       }
     }
+
+    console.info(
+      `[PDF Compiler] Switching to secondary export path for ${job.id} (${targetVolume?.volumeId || 'full'})`
+    );
   }
+
+  const fallbackHtml = buildStandaloneAcademicHtml(job, targetVolume, true);
 
   if (driveToken) {
     try {
@@ -1265,7 +1573,7 @@ async function compileServerPdfBuffer(
           name: `_temp_pdf_render_${job.id}_${targetVolume?.volumeId || 'full'}`,
           mimeType: 'application/vnd.google-apps.document',
         },
-        Buffer.from(html, 'utf-8'),
+        Buffer.from(fallbackHtml, 'utf-8'),
         'text/html; charset=UTF-8'
       );
       const importRes = await fetch(
@@ -1687,19 +1995,19 @@ ${queued.map((q, idx) => `${idx + 1}. ${q.text || '结合新增补充附件扩�
 [分册意图自动检测]: ${splitIntent.shouldSplitVolumes ? `需要分册输出 (${splitIntent.reasonSummary})` : '无需强制新增分册'}
 [当前已有输出分册 (${job.plan.volumes?.length || 1} 册)]:
 ${(job.plan.volumes || []).map((v) => `- ${v.volumeId}: 《${v.volumeTitle}》(${v.role})`).join('\n') || '- vol-1: 主文档'}
-[已完成或正在执行的轮次 (${completedOrRunningBatches.length} 轮，不可修改)]:
-${completedOrRunningBatches.map((b) => `- 第 ${b.batchIndex} 轮: 《${b.title}》(${b.volumeId || 'vol-1'})`).join('\n') || '尚无已完成轮次'}
-[尚未执行的待办轮次 (${pendingBatches.length} 轮，可优化合并、调整范围或增补新轮次)]:
-${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.sections.join('、')}`).join('\n') || '当前无剩余待办轮次'}
+[已完成或正在执行的模块 (${completedOrRunningBatches.length} 个，不可修改)]:
+${completedOrRunningBatches.map((b) => `- 第 ${b.batchIndex} 模块: 《${b.title}》(${b.volumeId || 'vol-1'})`).join('\n') || '尚无已完成模块'}
+[尚未执行的待办模块 (${pendingBatches.length} 个，可优化合并、调整范围或增补新模块)]:
+${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.sections.join('、')}`).join('\n') || '当前无剩余待办模块'}
 
-请根据最新补充指令，精炼更新后的《全局执行规范摘要》(refinedMasterBrief)，并输出更新后的【剩余待执行轮次列表】(updatedPendingBatches，每轮目标约 ${singleCallWords} 字，充分利用单次调用极限，需要多少轮就安排多少轮；若原待办轮次只需微调则直接在其上融入新要求，无需无故堆砌轮次)，以及可选的【新增独立分册】(additionalVolumes，仅当用户新增了诸如“答案单独一份文件”或“再加一册专题”且现有分册尚未覆盖时添加)。`;
+请根据最新补充指令，精炼更新后的《全局执行规范摘要》(refinedMasterBrief)，并输出更新后的【剩余待执行模块列表】(updatedPendingBatches，每个模块控制在质量甜点约 ${singleCallWords} 字，优先保证推导与排版质量，最后统一无缝拼接；并可为每个模块指定最适配专精模型 assignedModelId：gemini-4-carbon / gemini-4-argon / gemini-4-hydrogen / gemini-3.1-flash-lite)，以及可选的【新增独立分册】(additionalVolumes)。`;
 
     const resp = await ai.models.generateContent({
       model: CARBON_MODEL,
       contents: deltaPrompt,
       config: {
         systemInstruction:
-          '你是高效的学术工作流动态重编排引擎。你的职责是在不打断已完成工作的前提下，将用户的新增要求无损整合进剩余轮次与独立分册配置中，最大化单次调用 Token 效率。',
+          '你是基于 Gemini 4 Carbon 的多模型协同动态重编排引擎。你的职责是在不打断已完成工作的前提下，将用户的新增要求无损整合进剩余模块、专精模型分工与独立分册配置中，最大化 Token 效率与输出质量。',
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         responseMimeType: 'application/json',
         responseSchema: {
@@ -1732,6 +2040,8 @@ ${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.s
                   targetWords: { type: Type.INTEGER },
                   includeAnswerKey: { type: Type.BOOLEAN },
                   volumeId: { type: Type.STRING },
+                  assignedModelId: { type: Type.STRING },
+                  dispatchReason: { type: Type.STRING },
                 },
                 required: [
                   'title',
@@ -1749,7 +2059,7 @@ ${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.s
       },
     });
 
-    addMeasuredUsageToJob(jobId, resp);
+    addMeasuredUsageToJob(jobId, resp, CARBON_MODEL, '动态需求整合与多模型重编排');
     const raw = (resp.text ?? '{}').trim();
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw) as {
@@ -1810,6 +2120,7 @@ ${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.s
       const rawUpdatedPending = Array.isArray(parsed.updatedPendingBatches)
         ? parsed.updatedPendingBatches
         : [];
+      const totalPlannedCount = lockedPlanBatches.length + rawUpdatedPending.length;
 
       const nextPendingSpecs: TaskBatchSpec[] =
         rawUpdatedPending.length > 0
@@ -1818,21 +2129,42 @@ ${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.s
               const requestedVolId = pb.volumeId ? String(pb.volumeId) : '';
               const resolvedVol =
                 volMap.get(requestedVolId) || existingVols[existingVols.length - 1];
+              const bTitle = String(pb.title || `第 ${bNum} 模块动态整合精编`);
+              const bScope = String(pb.scopeSummary || '');
+              const bSections =
+                Array.isArray(pb.sections) && pb.sections.length > 0
+                  ? pb.sections.map(String)
+                  : ['补充与整合章节展开'];
+              const routed = routeSpecialistModelForBatch({
+                batchIndex: bNum,
+                totalBatches: totalPlannedCount,
+                title: bTitle,
+                scopeSummary: bScope,
+                sections: bSections,
+                mode: prev.mode,
+                volumeRole: resolvedVol.role,
+                requestedModelId: pb.assignedModelId ? String(pb.assignedModelId) : undefined,
+                requestedReason: pb.dispatchReason ? String(pb.dispatchReason) : undefined,
+              });
+              const clampedWords = clampModuleWordsToQualitySweetSpot(
+                Number(pb.targetWords) || singleCallWords,
+                prev.depth
+              );
               return {
                 batchIndex: bNum,
-                title: String(pb.title || `第 ${bNum} 轮动态整合模块`),
-                scopeSummary: String(pb.scopeSummary || ''),
-                sections:
-                  Array.isArray(pb.sections) && pb.sections.length > 0
-                    ? pb.sections.map(String)
-                    : ['补充与整合章节展开'],
-                estimatedPages: Math.max(4, Number(pb.estimatedPages) || 10),
-                targetWords: Math.max(4000, Number(pb.targetWords) || singleCallWords),
+                title: bTitle,
+                scopeSummary: bScope,
+                sections: bSections,
+                estimatedPages: Math.max(4, Math.ceil(clampedWords / 650)),
+                targetWords: clampedWords,
                 includeAnswerKey: Boolean(
                   pb.includeAnswerKey ?? (resolvedVol.role === 'solutions_manual' || prev.mode === 'workbook')
                 ),
                 volumeId: resolvedVol.volumeId,
                 volumeIndex: resolvedVol.volumeIndex,
+                assignedModelId: routed.assignedModelId,
+                specialistRole: routed.specialistRole,
+                dispatchReason: routed.dispatchReason,
                 isSupplementalBatch: idx >= pendingBatches.length,
               };
             })
@@ -1843,6 +2175,7 @@ ${pendingBatches.map((b) => `- 《${b.title}》(${b.volumeId || 'vol-1'}): ${b.s
         title: spec.title,
         volumeId: spec.volumeId,
         volumeIndex: spec.volumeIndex,
+        modelUsed: spec.assignedModelId,
         status: 'pending',
         continuationCount: 0,
         autoRetryCount: 0,
@@ -1964,16 +2297,29 @@ export function appendSupplementalDirectiveToJob(params: {
     const nextIdx = updatedPlan.batches.length + 1;
     const singleCallWords = SINGLE_CALL_TARGET_WORDS_BY_DEPTH[job.depth];
     const lastVol = updatedPlan.volumes?.[updatedPlan.volumes.length - 1];
+    const suppSections = ['补充要求专项展开与推导', '新增资料融合解析与修正补遗'];
+    const routed = routeSpecialistModelForBatch({
+      batchIndex: nextIdx,
+      totalBatches: nextIdx,
+      title: `补充与修正增补模块（第 ${nextIdx} 模块）`,
+      scopeSummary: directive.text,
+      sections: suppSections,
+      mode: job.mode,
+      volumeRole: lastVol?.role,
+    });
     const suppSpec: TaskBatchSpec = {
       batchIndex: nextIdx,
-      title: `补充与修正增补专轮（第 ${nextIdx} 轮）`,
+      title: `补充与修正增补模块（第 ${nextIdx} 模块）`,
       scopeSummary: directive.text || '结合新增补充要求与上传附件进行深度增补与修正完善',
-      sections: ['补充要求专项展开与推导', '新增资料融合解析与修正补遗'],
-      estimatedPages: Math.ceil(singleCallWords / 850),
+      sections: suppSections,
+      estimatedPages: Math.max(4, Math.ceil(singleCallWords / 650)),
       targetWords: singleCallWords,
       includeAnswerKey: job.mode === 'workbook',
       volumeId: lastVol?.volumeId || 'vol-1',
       volumeIndex: lastVol?.volumeIndex || 1,
+      assignedModelId: routed.assignedModelId,
+      specialistRole: routed.specialistRole,
+      dispatchReason: routed.dispatchReason,
       isSupplementalBatch: true,
     };
     updatedPlan = {
@@ -1987,6 +2333,7 @@ export function appendSupplementalDirectiveToJob(params: {
         title: suppSpec.title,
         volumeId: suppSpec.volumeId,
         volumeIndex: suppSpec.volumeIndex,
+        modelUsed: suppSpec.assignedModelId,
         status: 'pending',
         continuationCount: 0,
         autoRetryCount: 0,
@@ -1998,6 +2345,7 @@ export function appendSupplementalDirectiveToJob(params: {
   const updated = updateJobState(params.jobId, (prev) => ({
     ...prev,
     updatedAt: new Date().toISOString(),
+    isStitchedAndPolished: false,
     plan: updatedPlan || prev.plan,
     batches: updatedBatches.length > prev.batches.length ? updatedBatches : prev.batches,
     attachmentsMeta: [...prev.attachmentsMeta, ...newAttSummaries],
@@ -2039,6 +2387,9 @@ async function generateExpandedPlanServer(params: {
   const currentJobSnapshot = jobsMap.get(params.jobId);
   const liveDirectives = currentJobSnapshot?.supplementalDirectives || [];
   const volumeSplitMode: VolumeSplitMode = currentJobSnapshot?.volumeSplitMode || 'auto';
+  const colorTheme: ColorPaletteTheme = currentJobSnapshot?.colorTheme || 'academic_blue';
+  const autoGenerateFigures = currentJobSnapshot?.autoGenerateFigures ?? true;
+  const palette = resolveColorPaletteSpec(colorTheme);
 
   const consolidated = consolidateRequirementsPure({
     rawUserPrompt: params.rawUserPrompt,
@@ -2061,42 +2412,76 @@ async function generateExpandedPlanServer(params: {
 
   const singleCallTargetWords = SINGLE_CALL_TARGET_WORDS_BY_DEPTH[params.depth];
 
-  const adaptiveRoundGuidance = `【动态自适应满载工作流原则 —— 严禁固定轮次上限】：
-- 每一轮生成（batch）都必须充分利用 Gemini 4 Carbon 单次调用的输出极限（每轮目标约 ${singleCallTargetWords.toLocaleString()} 字/词的高密度完整章节或题组，绝不要把三五百字的小节拆成零碎批次）。
-- **绝不要预设固定的 1-2 轮或 3-4 轮限制**！完全根据知识体系的真实深度、章节跨度与分册数量动态决定总轮数：简明单章课题若 1 轮满载即可写透就只排 1 轮；中等专题可排 2-5 轮；大型竞赛全套讲义、多模块分册教材或“正题册 + 独立全解册”需要多少轮（如 6 轮、8 轮、12 轮甚至更多）就如实拆分成多少轮满载生成，直至 100% 无遗漏覆盖全部要求！`;
+  const adaptiveRoundGuidance = `【质量优先的适度单次容量 + 动态自适应模块数原则（严禁单次硬顶极限导致质量衰减）】：
+- 每个模块（batch）的单次输出目标控制在【质量甜点区间：约 ${singleCallTargetWords.toLocaleString()} 字/词】（绝对不要把单次 targetWords 硬顶到一万多字，避免尾段推理衰减、公式跳步或截断）。
+- **绝不固定模块/轮次上限**！为了兼顾最高推导质量与全量覆盖，按课题真实体量需要拆分成多少个高精模块（1..N 模块）就拆分成多少个模块，最后系统会将所有模块与插图无缝整合拼接成完整成书！`;
+
+  const multiModelRoutingGuidance = `【主思考模型 Carbon 多模型工具库按需分配调用规则】：
+你（\`gemini-4-carbon\`）作为总设计师，必须在 \`batches\` 中为每个模块指派最适配、最高 Token 性价比的专精模型（\`assignedModelId\`）并写明调度理由（\`dispatchReason\`）：
+1. \`gemini-4-carbon\`（主思考与严密证明模型，成本系数 1.00x）：仅分配给公理体系构建、高难度核心定理/压轴题无跳步严密证明板块（\`specialistRole = "orchestration_and_proof"\`）。
+2. \`gemini-4-argon\`（数理推导与分级命题专精模型，成本系数 0.62x）：优先分配给典型例题分步演算、分级练习题组设计、一题多解与独立答案详解分册（\`specialistRole = "stem_problem_derivation"\`）。
+3. \`gemini-4-hydrogen\`（高吞吐概念阐释与彩色知识框填色排版模型，成本系数 0.28x）：优先分配给背景动机导引、物理/几何直觉阐述、彩色填色知识框（定义框/定理框/警示框）与多维对比表格模块（\`specialistRole = "conceptual_prose_and_color_layout"\`）。
+4. \`gemini-3.1-flash-lite\`（极低 Token 速查索引与过渡衔接模型，成本系数 0.10x）：分配给全局符号速查表、附录公式卡或轻量总结索引模块（\`specialistRole = "lean_transition_and_index"\`）。
+${
+  autoGenerateFigures
+    ? `5. **Nano Banana 视觉插图按需调度（\`visualFigures\`）**：对需要几何/物理/机理图解的关键模块（每个模块 0–1 幅高价值插图，最多不超过 2 幅；纯代数推导或答案册可设为空数组），在 \`visualFigures\` 中规划插图描述（英文精细学术绘图提示词 \`prompt\`，适配当前「${palette.label}」白底教材配色）并指派：
+   - \`gemini-nano-banana-2.1\`（Nano Banana 2.1 高清科学机理与几何彩色插图引擎）：用于核心定理几何变换图、场线/受力/系统结构主图；
+   - \`gemini-3.1-flash-lite-image\`（Nano Banana Lite 快速示意图引擎）：用于例题/习题配套几何简图、状态转移图或实验装置简图。`
+    : '5. 用户当前已关闭自动配图，请将所有模块的 `visualFigures` 设为空数组 `[]`。'
+}`;
 
   const multiVolumeGuidance = multiVolumeDetection.shouldSplitVolumes
     ? `【多份独立分册文件输出规则（已激活）】：
 - 检测结论：${multiVolumeDetection.reasonSummary}
 - 你必须在 \`volumes\` 数组中规划多份独立的输出文件（每份对应一个独立 PDF 文件，如 \`vol-1\`, \`vol-2\`, ...），为每册赋予清晰的 \`volumeTitle\`、独立 PDF 文件名 \`suggestedFileName\` 与角色 \`role\`（可选值：\`main_lecture\` / \`workbook\` / \`solutions_manual\` / \`chapter_volume\` / \`supplement_volume\`）。
-- 若用户要求“答案和解析另外一份文件”，请将正文讲义/题本放入前序分册（其 \`includeAnswerKey\` 设为 \`false\`，避免剧透），并将全部例题/练习题的详尽解答与评分标准单独规划为独立的 \`solutions_manual\` 分册！
-- \`batches\` 中的每一轮必须通过 \`volumeId\` 和 \`volumeIndex\` 明确归属到对应的独立分册，且每个分册至少包含 1 轮（体量大的分册可包含多轮满载生成）。`
+- 若用户要求“答案和解析另外一份文件”，请将正文讲义/题本放入前序分册（其 \`includeAnswerKey\` 设为 \`false\`，避免剧透），并将全部例题/练习题的详尽解答与评分标准单独规划为独立的 \`solutions_manual\` 分册（优先调度 \`gemini-4-argon\` 执笔）！
+- \`batches\` 中的每个模块必须通过 \`volumeId\` 和 \`volumeIndex\` 明确归属到对应的独立分册。`
     : `【文件输出组织规则】：
-- 当前无需拆分为多份文件，请在 \`volumes\` 中仅规划 1 个主输出卷（\`vol-1\`），并将所有 \`batches\` 的 \`volumeId\` 设为 \`"vol-1"\`、\`volumeIndex\` 设为 \`1\`。但若你在仔细审读用户原始指令时发现用户其实明确要求了拆分为多份独立文件/独立答案册，也可在 \`volumes\` 中如实规划多个分册。`;
+- 当前无需拆分为多份文件，请在 \`volumes\` 中仅规划 1 个主输出卷（\`vol-1\`），并将所有 \`batches\` 的 \`volumeId\` 设为 \`"vol-1"\`、\`volumeIndex\` 设为 \`1\`。但若你在审读用户指令时发现用户明确要求拆分为多份独立文件/独立答案册，也可在 \`volumes\` 中如实规划多个分册。`;
 
   const docTypeLabel =
     params.mode === 'workbook'
       ? '系统化分级学术练习题册（含基础巩固、综合进阶、压轴证明/建模题，以及完整分步解析与评分要点）'
-      : '大学/研究生/竞赛级深度课程讲义（含核心定义、定理与严密证明、几何/物理直觉阐释、典型例题演算、易错辨析与章节小结）';
+      : '大学/研究生/竞赛级深度课程讲义（含彩色填色定义框、定理框与严密证明、Nano Banana 教学插图、典型例题演算框与易错警示框）';
 
+  const pageOrientationPref: PageOrientationMode = currentJobSnapshot?.pageOrientation || 'auto';
+  const resolvedOrientation = detectResolvedPageOrientation({
+    explicitOrientation: pageOrientationPref,
+    rawPrompt: params.rawUserPrompt,
+    directivesTexts: liveDirectives.map((d) => d.text),
+  });
+
+  // Compact planning memory window (14,000 chars max instead of 140k!) keeps full heading/numbering/symbol ledgers
+  // while cutting structured-JSON planning latency from 90s+ down to ~8–15s so planning NEVER stalls!
+  const allOwnerJobs = currentJobSnapshot
+    ? getAllHistoricalJobsForJobOwner(currentJobSnapshot)
+    : [];
   const longContextMemoryBlock = currentJobSnapshot
     ? buildLongContextMemoryPrompt({
         currentJob: currentJobSnapshot,
-        allUserJobs: getAllHistoricalJobsForJobOwner(currentJobSnapshot),
-        maxReferenceChars: 140_000,
+        allUserJobs: allOwnerJobs,
+        maxReferenceChars: 14_000,
       })
     : '';
 
-  const plannerInstruction = `你是顶尖高校课程体系总设计师与学术出版主编，具备跨任务强历史记忆与百万级长上下文理解能力。
+  const orientationGuidance =
+    resolvedOrientation === 'landscape'
+      ? `\n7. 【横版 A4 宽屏演示 (PPT 级可读) 版式规则】：用户要求横版展示/演示版式（297×210mm）。请按高可读性的“宽屏教学幻灯片章节”节奏规划各模块的 \`sections\`，让每个二级标题对应一个主题鲜明、公式推导清晰、适合投影授课与平板横屏阅读的知识单元。`
+      : '';
+
+  const plannerInstruction = `你是基于 Gemini 4 Carbon 的学术出版总设计师与多模型协同调度主编，具备跨任务强历史记忆与百万级长上下文理解能力。
 你的任务是：
-1. 深度解析用户整合后的全部要求、自动抓取识别的云盘/网页资料、关联前序基准任务长上下文，将其扩写完善为严谨、体系化的《扩展学术编纂规范》(expandedPrompt)。
-2. 若绑定了前序基准任务或处于系列课程脉络中，100%继承前序文档的数学物理符号体系、术语约定与难度梯度。
+1. 深度解析用户整合后的全部要求、抓取资料与历史长上下文，扩写为严谨的《扩展学术编纂规范》(expandedPrompt)，并在 \`orchestrationSummary\` 中简明阐述本次 Carbon 如何联合 Argon / Hydrogen / Nano Banana 等专精模型协同分工及控制单次输出甜点。
+2. 100%继承关联前序文档的数学物理符号体系、术语约定与难度梯度。
 3. 自动识别学科归属 (subjectCategory) 与课程编号 (courseCode)，生成专业总标题与文件名。
 4. ${multiVolumeGuidance}
-5. ${adaptiveRoundGuidance}`;
+5. ${adaptiveRoundGuidance}
+6. ${multiModelRoutingGuidance}${orientationGuidance}`;
 
   const userTaskText = `[目标文档形态]: ${docTypeLabel}
-[期望深度档位]: ${params.depth}（单次调用满载目标约 ${singleCallTargetWords.toLocaleString()} 字/轮）
+[页面版式]: ${resolvedOrientation === 'landscape' ? '横版宽屏演示 PDF (A4 Landscape 297×210mm · 适合课堂 PPT 投影与展示)' : '竖版标准学术 PDF (A4 Portrait 210×297mm)'}
+[期望深度档位]: ${params.depth}（单次调用质量甜点目标：约 ${singleCallTargetWords.toLocaleString()} 字/模块 · 优先保证输出质量，最后自动无缝拼接）
+[填色排版主题]: ${palette.label}（${palette.description}）
 [Google Cloud 归档根目录]: ${params.customRootFolder || 'Carbon 学术归档'}
 [自动整合后的全局需求规范 (v${consolidated.version})]:
 ${consolidated.synthesizedMasterBrief}
@@ -2104,103 +2489,164 @@ ${consolidated.synthesizedMasterBrief}
 [用户原始输入全文]:
 ${params.rawUserPrompt.trim() || '请基于上传或链接抓取的参考文件/前序已完成文档，系统提炼并扩展生成完整文档。'}
 ${longContextMemoryBlock ? `\n${longContextMemoryBlock}\n` : ''}
-请输出严格符合 JSON Schema 的扩展规划、独立分册定义 (volumes) 与动态自适应满载生成轮次流 (batches)。`;
+请输出严格符合 JSON Schema 的扩展规划、多模型协同策略说明 (orchestrationSummary)、独立分册定义 (volumes) 与带专精模型指派的模块流 (batches)。`;
 
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= 3; attempt++) {
-    if (params.signal.aborted) throw new Error('ABORTED');
-    try {
-      const response = await ai.models.generateContent({
-        model: CARBON_MODEL,
-        contents: { parts: [...attachmentParts, { text: userTaskText }] as never },
-        config: {
-          systemInstruction: plannerInstruction,
-          thinkingConfig: {
-            thinkingLevel: params.depth === 'standard' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH,
+  const plannerModels = [CARBON_MODEL, 'gemini-4-argon', 'gemini-4-hydrogen'];
+  const planSchema = {
+    type: Type.OBJECT,
+    properties: {
+      documentTitle: { type: Type.STRING },
+      subtitle: { type: Type.STRING },
+      subjectCategory: { type: Type.STRING },
+      courseCode: { type: Type.STRING },
+      suggestedFileName: { type: Type.STRING },
+      expandedPrompt: { type: Type.STRING },
+      adaptiveStrategyNote: { type: Type.STRING },
+      orchestrationSummary: { type: Type.STRING },
+      pedagogicalGoals: { type: Type.ARRAY, items: { type: Type.STRING } },
+      volumes: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            volumeId: { type: Type.STRING },
+            volumeIndex: { type: Type.INTEGER },
+            volumeTitle: { type: Type.STRING },
+            subtitle: { type: Type.STRING },
+            suggestedFileName: { type: Type.STRING },
+            role: { type: Type.STRING },
+            scopeSummary: { type: Type.STRING },
           },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              documentTitle: { type: Type.STRING },
-              subtitle: { type: Type.STRING },
-              subjectCategory: { type: Type.STRING },
-              courseCode: { type: Type.STRING },
-              suggestedFileName: { type: Type.STRING },
-              expandedPrompt: { type: Type.STRING },
-              adaptiveStrategyNote: { type: Type.STRING },
-              pedagogicalGoals: { type: Type.ARRAY, items: { type: Type.STRING } },
-              volumes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    volumeId: { type: Type.STRING },
-                    volumeIndex: { type: Type.INTEGER },
-                    volumeTitle: { type: Type.STRING },
-                    subtitle: { type: Type.STRING },
-                    suggestedFileName: { type: Type.STRING },
-                    role: { type: Type.STRING },
-                    scopeSummary: { type: Type.STRING },
-                  },
-                  required: [
-                    'volumeId',
-                    'volumeIndex',
-                    'volumeTitle',
-                    'subtitle',
-                    'suggestedFileName',
-                    'role',
-                    'scopeSummary',
-                  ],
+          required: [
+            'volumeId',
+            'volumeIndex',
+            'volumeTitle',
+            'subtitle',
+            'suggestedFileName',
+            'role',
+            'scopeSummary',
+          ],
+        },
+      },
+      batches: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            batchIndex: { type: Type.INTEGER },
+            volumeId: { type: Type.STRING },
+            volumeIndex: { type: Type.INTEGER },
+            title: { type: Type.STRING },
+            scopeSummary: { type: Type.STRING },
+            sections: { type: Type.ARRAY, items: { type: Type.STRING } },
+            estimatedPages: { type: Type.INTEGER },
+            targetWords: { type: Type.INTEGER },
+            includeAnswerKey: { type: Type.BOOLEAN },
+            assignedModelId: { type: Type.STRING },
+            specialistRole: { type: Type.STRING },
+            dispatchReason: { type: Type.STRING },
+            visualFigures: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  figureId: { type: Type.STRING },
+                  caption: { type: Type.STRING },
+                  prompt: { type: Type.STRING },
+                  aspectRatio: { type: Type.STRING },
+                  assignedImageModelId: { type: Type.STRING },
+                  placementSectionHint: { type: Type.STRING },
                 },
-              },
-              batches: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    batchIndex: { type: Type.INTEGER },
-                    volumeId: { type: Type.STRING },
-                    volumeIndex: { type: Type.INTEGER },
-                    title: { type: Type.STRING },
-                    scopeSummary: { type: Type.STRING },
-                    sections: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    estimatedPages: { type: Type.INTEGER },
-                    targetWords: { type: Type.INTEGER },
-                    includeAnswerKey: { type: Type.BOOLEAN },
-                  },
-                  required: [
-                    'batchIndex',
-                    'volumeId',
-                    'volumeIndex',
-                    'title',
-                    'scopeSummary',
-                    'sections',
-                    'estimatedPages',
-                    'targetWords',
-                    'includeAnswerKey',
-                  ],
-                },
+                required: [
+                  'figureId',
+                  'caption',
+                  'prompt',
+                  'aspectRatio',
+                  'assignedImageModelId',
+                ],
               },
             },
-            required: [
-              'documentTitle',
-              'subtitle',
-              'subjectCategory',
-              'courseCode',
-              'suggestedFileName',
-              'expandedPrompt',
-              'pedagogicalGoals',
-              'volumes',
-              'batches',
-            ],
           },
+          required: [
+            'batchIndex',
+            'volumeId',
+            'volumeIndex',
+            'title',
+            'scopeSummary',
+            'sections',
+            'estimatedPages',
+            'targetWords',
+            'includeAnswerKey',
+            'assignedModelId',
+            'dispatchReason',
+          ],
         },
-      });
+      },
+    },
+    required: [
+      'documentTitle',
+      'subtitle',
+      'subjectCategory',
+      'courseCode',
+      'suggestedFileName',
+      'expandedPrompt',
+      'pedagogicalGoals',
+      'volumes',
+      'batches',
+    ],
+  };
 
-      addMeasuredUsageToJob(params.jobId, response);
+  for (let attempt = 0; attempt < plannerModels.length; attempt++) {
+    if (params.signal.aborted) throw new Error('ABORTED');
+    const candidateModel = plannerModels[attempt];
+    try {
+      const planResult = await Promise.race([
+        (async () => {
+          const stream = await ai.models.generateContentStream({
+            model: candidateModel,
+            contents: { parts: [...attachmentParts, { text: userTaskText }] as never },
+            config: {
+              systemInstruction: plannerInstruction,
+              thinkingConfig: {
+                thinkingLevel: ThinkingLevel.MEDIUM,
+              },
+              responseMimeType: 'application/json',
+              responseSchema: planSchema,
+            },
+          });
 
-      const rawText = (response.text ?? '{}').trim();
+          let collected = '';
+          let lastUsageChunk: GenerateContentResponse | null = null;
+          let lastBeat = Date.now();
+          for await (const rawChunk of stream) {
+            if (params.signal.aborted) throw new Error('ABORTED');
+            const chunk = rawChunk as GenerateContentResponse;
+            if (chunk.usageMetadata) lastUsageChunk = chunk;
+            if (chunk.text) {
+              collected += chunk.text;
+            }
+            if (Date.now() - lastBeat > 4000) {
+              lastBeat = Date.now();
+              updateJobState(params.jobId, (prev) => prev, false);
+            }
+          }
+          return { collected, lastUsageChunk };
+        })(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('PLANNING_TIMEOUT_75S')), 75_000)
+        ),
+      ]);
+
+      if (planResult.lastUsageChunk) {
+        addMeasuredUsageToJob(
+          params.jobId,
+          planResult.lastUsageChunk,
+          candidateModel,
+          '总纲规划与多模型协同路由调度'
+        );
+      }
+
+      const rawText = (planResult.collected || '{}').trim();
       const jsonMatch = rawText.match(/\{[\s\S]*\}/);
       const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : rawText) as Record<string, unknown>;
 
@@ -2211,22 +2657,153 @@ ${longContextMemoryBlock ? `\n${longContextMemoryBlock}\n` : ''}
         customRootFolder: params.customRootFolder,
         rawUserPrompt: params.rawUserPrompt,
         multiVolumeDetection,
+        colorTheme,
+        autoGenerateFigures,
+        pageOrientation: pageOrientationPref,
+        directives: liveDirectives,
       });
     } catch (err) {
-      lastErr = err;
+      if (params.signal.aborted || (err instanceof Error && err.message === 'ABORTED')) {
+        throw new Error('ABORTED');
+      }
       const info = formatGeminiError(err);
-      if (!info.isTransient || attempt === 3) break;
-      await new Promise((r) => setTimeout(r, 1800 * Math.pow(2, attempt)));
+      if (!info.isTransient && String(err).includes('API_KEY_INVALID')) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
     }
   }
-  throw lastErr;
+
+  // Ultimate Zero-Pause Guarantee: if all upstream JSON planning attempts timed out or truncated,
+  // synthesize a deterministic multi-module / multi-volume plan immediately so execution proceeds seamlessly!
+  const refJob = allOwnerJobs.find(
+    (j) =>
+      j.id === currentJobSnapshot?.parentJobId ||
+      currentJobSnapshot?.sourceContextJobIds?.includes(j.id)
+  );
+  console.warn(
+    `[Zero-Pause Planner Fallback] Using deterministic fallback plan for ${params.jobId} to prevent planning stall.`
+  );
+  return buildDeterministicFallbackPlan({
+    mode: params.mode,
+    depth: params.depth,
+    customRootFolder: params.customRootFolder,
+    rawUserPrompt: params.rawUserPrompt,
+    consolidatedMasterBrief: consolidated.synthesizedMasterBrief,
+    multiVolumeDetection,
+    colorTheme,
+    autoGenerateFigures,
+    pageOrientation: pageOrientationPref,
+    directives: liveDirectives,
+    referenceJobTitle: refJob?.plan?.documentTitle,
+  });
 }
 
 /**
- * Streams a single round or intra-round continuation pass on the server with:
- * - Token-efficient consolidated requirement synthesis + compact numbering/symbol ledger (~70% less continuation input tokens!)
- * - Automatic mid-stream disconnect recovery
- * - Volume-specific isolation (e.g. separate Solutions Manual vs clean Lecture/Problem volume)
+ * Invokes Nano Banana (`gemini-nano-banana-2.1` / `gemini-3.1-flash-lite-image` / `gemini-3-pro-image`)
+ * to generate publication-grade academic illustrations planned by Carbon for a module.
+ * Strictly follows @google/genai image generation rules (NO responseMimeType / responseSchema,
+ * iterates through candidate parts to locate inlineData). Non-fatal if an image call fails!
+ */
+async function generateModuleFiguresServer(params: {
+  jobId: string;
+  batchSpec: TaskBatchSpec;
+  signal: AbortSignal;
+}): Promise<GeneratedFigureAsset[]> {
+  const specs = (params.batchSpec.visualFigures || []).slice(0, 2);
+  if (specs.length === 0) return [];
+
+  ensureStorageDirs();
+  const ai = getGenAIClient();
+  const jobMediaDir = path.join(MEDIA_CACHE_DIR, path.basename(params.jobId));
+  fs.mkdirSync(jobMediaDir, { recursive: true });
+
+  const generatedAssets: GeneratedFigureAsset[] = [];
+
+  for (const spec of specs) {
+    if (params.signal.aborted) throw new Error('ABORTED');
+
+    const candidateModels =
+      spec.assignedImageModelId === 'gemini-3.1-flash-lite-image'
+        ? ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1']
+        : [spec.assignedImageModelId, 'gemini-3.1-flash-lite-image'];
+
+    for (const imgModel of candidateModels) {
+      if (params.signal.aborted) throw new Error('ABORTED');
+      try {
+        const supportsExplicitSize =
+          imgModel === 'gemini-nano-banana-2.1' || imgModel === 'gemini-3-pro-image';
+        const imgResp = await ai.models.generateContent({
+          model: imgModel,
+          contents: {
+            parts: [{ text: spec.prompt }],
+          },
+          config: {
+            imageConfig: {
+              aspectRatio: spec.aspectRatio || '16:9',
+              ...(supportsExplicitSize ? { imageSize: '1K' } : {}),
+            },
+          },
+        });
+
+        let foundBase64 = '';
+        let foundMime = 'image/png';
+        for (const part of imgResp.candidates?.[0]?.content?.parts ?? []) {
+          if (part.inlineData?.data) {
+            foundBase64 = part.inlineData.data;
+            foundMime = part.inlineData.mimeType || 'image/png';
+            break;
+          }
+        }
+
+        if (foundBase64) {
+          const ext = foundMime.includes('jpeg') || foundMime.includes('jpg') ? 'jpg' : 'png';
+          const safeFigId = spec.figureId.replace(/[^a-zA-Z0-9_-]/g, '-');
+          const fileName = `${safeFigId}.${ext}`;
+          const diskPath = path.join(jobMediaDir, fileName);
+          fs.writeFileSync(diskPath, Buffer.from(foundBase64, 'base64'));
+
+          addMeasuredUsageToJob(
+            params.jobId,
+            imgResp,
+            imgModel,
+            '学术原理与几何示意图绘制',
+            1
+          );
+
+          generatedAssets.push({
+            figureId: spec.figureId,
+            batchIndex: params.batchSpec.batchIndex,
+            volumeId: params.batchSpec.volumeId,
+            caption: spec.caption,
+            modelUsed: imgModel,
+            aspectRatio: spec.aspectRatio,
+            mimeType: foundMime,
+            mediaUrl: `/api/jobs/${encodeURIComponent(params.jobId)}/media/${encodeURIComponent(fileName)}`,
+            createdAt: new Date().toISOString(),
+          });
+          break;
+        }
+      } catch (imgErr) {
+        if (params.signal.aborted) throw new Error('ABORTED');
+        console.warn(
+          `[Nano Banana] Model ${imgModel} warning for ${spec.figureId}, trying fallback if available:`,
+          imgErr instanceof Error ? imgErr.message : String(imgErr)
+        );
+      }
+    }
+  }
+
+  return generatedAssets;
+}
+
+/**
+ * Streams a single quality-sized module or intra-module continuation pass on the server:
+ * - Dispatches to Carbon's assigned specialist model (`Carbon` / `Argon` / `Hydrogen` / `Flash Lite`)
+ *   with automatic fallback to `Carbon` on unexpected transient errors
+ * - Formats semantic color-filled callout boxes (`:::definition`, `:::theorem`, `:::example`, `:::warning`, `:::summary`)
+ * - Places `{{FIGURE:fig-id}}` anchors for Nano Banana illustrations
+ * - Keeps per-call output at the quality sweet spot (~3,600–5,800 words) for zero mid-proof degradation
  */
 async function executeBatchPassWithAutoRecovery(params: {
   jobId: string;
@@ -2240,7 +2817,12 @@ async function executeBatchPassWithAutoRecovery(params: {
   startAsContinuation: boolean;
   completedEarlierTexts: string[];
   signal: AbortSignal;
-}): Promise<{ rawPassOutput: string; mergedCleanText: string; finishReason: string }> {
+}): Promise<{
+  rawPassOutput: string;
+  mergedCleanText: string;
+  finishReason: string;
+  modelUsed: string;
+}> {
   const ai = getGenAIClient();
 
   await ensureJobPromptLinksScanned(params.jobId);
@@ -2248,7 +2830,6 @@ async function executeBatchPassWithAutoRecovery(params: {
   const liveJobRecord = jobsMap.get(params.jobId);
   const currentDirectives = liveJobRecord?.supplementalDirectives || [];
 
-  // Refresh pure consolidated requirements if any brand-new supplement arrived mid-batch!
   if (liveJobRecord && currentDirectives.some((d) => d.status === 'queued')) {
     const freshConsolidated = consolidateRequirementsPure({
       rawUserPrompt: liveJobRecord.rawUserPrompt,
@@ -2275,9 +2856,6 @@ async function executeBatchPassWithAutoRecovery(params: {
   let baseMarkdown = params.initialMarkdown;
   let isCont = params.startAsContinuation && baseMarkdown.trim().length > 0;
 
-  // Token-efficiency optimization on attachments:
-  // On initial round start (`!isCont`), pass all multimodal attachments.
-  // On intra-round continuation (`isCont`), avoid re-inlining huge `extractedText` / `base64Data` blocks that were already digested!
   const allLoadedAttachments = loadJobAttachments(params.jobId);
   const attachmentsForPass = isCont
     ? allLoadedAttachments.filter((a) => Boolean(a.fileUri || a.serverFileId))
@@ -2285,6 +2863,9 @@ async function executeBatchPassWithAutoRecovery(params: {
   const attachmentParts = await buildAttachmentPartsAsync(attachmentsForPass);
 
   const refreshedJobRecord = jobsMap.get(params.jobId);
+  const colorTheme: ColorPaletteTheme =
+    refreshedJobRecord?.colorTheme || params.plan.colorTheme || 'academic_blue';
+  const palette = resolveColorPaletteSpec(colorTheme);
   const currentVolume = params.plan.volumes?.find(
     (v) => v.volumeId === (params.batchSpec.volumeId || 'vol-1')
   );
@@ -2305,35 +2886,90 @@ async function executeBatchPassWithAutoRecovery(params: {
   const shouldWithholdSolutionsForSeparateVol =
     hasSeparateSolutionsVol && !isSolutionsManualPass && !params.batchSpec.includeAnswerKey;
 
+  const plannedFigures =
+    refreshedJobRecord?.autoGenerateFigures === false
+      ? []
+      : params.batchSpec.visualFigures || [];
+  const figureAnchorInstructions =
+    plannedFigures.length > 0
+      ? `\n7. 【Nano Banana 学术配图锚点规范】：本模块已指派视觉模型绘制 ${plannedFigures.length} 幅插图，请在正文中对应知识点最契合的段落之间单独一行插入精确占位符（系统将自动嵌入高清配图）：\n${plannedFigures
+          .map(
+            (vf) =>
+              `   - 单独一行输出 \`{{FIGURE:${vf.figureId}}}\`（对应图注：${vf.caption}）`
+          )
+          .join('\n')}`
+      : '';
+
   const modeSpecificRules = isSolutionsManualPass
     ? `当前正在编纂【独立答案与详解专册 (${currentVolume?.volumeTitle})】：
 - 本文件是与正文讲义/题本分离的独立答案解析 PDF！
-- 必须严格逐题对应前序分册中的所有例题/训练题编号，提供 100% 无跳步的完整推导、多解对比、易错点剖析与按步评分标准，严禁出现“同理可得”、“计算略”！`
+- 必须严格逐题对应前序分册中的所有例题/训练题编号，使用 \`:::example 题 X.X 分步解析与采分标准\` 彩色框包裹关键采分总结，提供 100% 无跳步的完整推导、多解对比与易错点剖析，严禁出现“同理可得”、“计算略”！`
     : shouldWithholdSolutionsForSeparateVol
       ? `当前正在编纂【正文讲义/题本独立分册 (${currentVolume?.volumeTitle}) —— 答案解析将另附独立分册】：
-- 用户要求将答案和详细解析单独成册输出！因此本分册专注于核心理论推导、直观图解以及例题/训练题的**完整题干与清晰编号**（如 例 1.1、题 1.1），不要在本分册题干下方直接展开最终答案与题解（留给后续独立的答案解析分册逐题详述）！`
+- 用户要求将答案和详细解析单独成册输出！因此本分册专注于核心理论推导、彩色知识框、直观图解以及例题/训练题的**完整题干与清晰编号**（如 例 1.1、题 1.1），不要在本分册题干下方直接展开最终答案与题解！`
       : params.mode === 'workbook'
         ? `当前为【练习题册 PDF 模式】：
 - 按梯度编排高质量题目（例如：**题 1.1 · 难度：进阶 · 考点：核心定理应用**）。
 - 涵盖概念辨析题、计算推导题、综合应用/证明压轴题。
-- 附上【详尽分步解答与评分标准】，所有公式推导一步步完整写出，严禁出现“同理可得”、“证明略”！`
-        : `当前为【课程讲义 PDF 模式】：
-- 遵循出版级大学/竞赛讲义体例：背景动机 -> 严格定义 -> 核心定理与完整分步证明 -> 直观解释 -> 典型例题演算 -> 常见误区辨析。
-- 所有推导步骤、中间变换、边界条件必须100%详尽展开，严禁出现“显然”、“证明从略”！`;
+- 每道题均附上详尽分步解答与评分标准（可用 \`:::example 分步解析与评分标准\` 彩色填色框呈现核心推导与得分点），严禁出现“同理可得”、“证明略”！`
+        : `当前为【出版级彩色课程讲义 PDF 模式（主题：${palette.label}）】：
+- 遵循现代大学/竞赛全彩教材体例：背景动机 -> 彩色定义框 -> 彩色核心定理框与完整分步证明 -> 几何/物理直觉 -> 彩色典型例题演算框 -> 彩色易错警示框 -> 结构化总结表。
+- 所有推导步骤、中间变换、边界条件必须 100% 详尽展开，严禁出现“显然”、“证明从略”！`;
 
-  const systemInstruction = `你是基于 Gemini 4 Carbon 的学术讲义与练习题册首席撰写引擎，具备超长上下文全局记忆与单次调用极限满载撰写能力。
-排版与一致性规范：
-1. 使用标准清晰的 Markdown 层级（# / ## / ###，定义与提示可用 > 引用块或表格）。
-2. 所有数学公式必须使用标准 LaTeX 语法：行内公式 $...$，独立公式块独立成行 $$...$$。
-3. 严格保持跨轮次、跨分册、跨历史关联任务的数学物理符号、章节序号、定义/定理/例题/习题编号全局一致，承接前文脉络，绝不重复已写内容！
-4. 充分利用单次调用输出容量，把本轮规划的每一节写深、写透、写完整！不要输出任何寒暄语，直接从正文标题或续写断点处开始输出！
-5. ${modeSpecificRules}
-6. 唯有当本轮规划的所有章节 (${params.batchSpec.sections.join('、')}) 及整合后的全部要求详尽撰写完毕、没有任何未闭合公式时，在全文最末尾单独一行输出标记：[[BATCH_COMPLETE]]。`;
+  const isLandscapeDeck =
+    detectResolvedPageOrientation({
+      explicitOrientation: refreshedJobRecord?.pageOrientation,
+      planOrientation: params.plan.pageOrientation,
+      rawPrompt: refreshedJobRecord?.rawUserPrompt || '',
+      directivesTexts: (refreshedJobRecord?.supplementalDirectives || []).map((d) => d.text),
+    }) === 'landscape';
+
+  const landscapeStyleClause = isLandscapeDeck
+    ? '\n- 【横版宽屏演示 PPT 级可读性规范】：当前输出为横版 A4 (297×210mm) 演示讲义，请保持段落层次精炼醒目，善用彩色定义/定理/总结框、要点列表与结构化对比表，避免单段超长密排纯文字墙，确保投影授课与屏幕展示一目了然（同时数学推导步骤依然 100% 完整无跳步）！'
+    : '';
+
+  const assignedSpecialistId = params.batchSpec.assignedModelId || CARBON_MODEL;
+  const specialistEntry = getToolModelEntry(assignedSpecialistId);
+
+  const systemInstruction = `你是 Carbon 多模型协同出版工坊中的专精执笔引擎【${specialistEntry.displayName}】，当前承担职责：${
+    params.batchSpec.dispatchReason || specialistEntry.bestForSummary
+  }。
+排版、填色知识框与质量规范：
+1. 使用清晰的 Markdown 层级（# / ## / ###）与结构化表格（表头将自动按「${palette.label}」主题填色）。
+2. 【出版级彩色填色排版规范】：对于核心定义、重要定理、典型例题演算、易错陷阱警示与章节方法总结，请主动使用以下独立闭合的语义填色框语法（开始行 \`:::类型 标题\`，结束行单独 \`:::\`，内部支持多段文字与 $$ 公式块）：
+   - \`:::definition 定义 1.1：名称\` ... \`:::\`
+   - \`:::theorem 定理 1.1：名称\` ... \`:::\`
+   - \`:::example 例 1.1：典型算例\` ... \`:::\`
+   - \`:::warning 易错辨析与边界条件\` ... \`:::\`
+   - \`:::summary 核心方法速查\` ... \`:::\`
+3. 所有数学公式必须使用标准 LaTeX 语法：行内公式 $...$，独立公式块独立成行 $$...$$（切勿将 \\texttt 嵌套在 \\textbf 内部，使用标准数学记号如 \\mathtt 或 \\mathbf）。
+4. 严格保持跨模块、跨分册、跨历史关联任务的符号、章节号、定义/定理/例题/习题编号全局顺延一致，绝不重复前文已写内容！
+5. 【质量优先 · 适度单次篇幅】：本模块聚焦把规划小节写精、写透、无跳步（理想篇幅约 ${params.batchSpec.targetWords.toLocaleString()} 字左右，不必盲目注水凑极限字数，确保每一行公式推导与排版质量达到出版水准）！不要输出任何寒暄语，直接从正文标题或续写断点处开始！
+6. ${modeSpecificRules}${landscapeStyleClause}${figureAnchorInstructions}
+8. 当本模块规划的所有小节 (${params.batchSpec.sections.join('、')}) 详尽撰写完毕、所有公式与 \`:::\` 填色框均完整闭合后，在全文最末尾单独一行输出标记：[[BATCH_COMPLETE]]。`;
 
   let lastErr: unknown;
+  const fallbackCascadeModels = Array.from(
+    new Set([assignedSpecialistId, CARBON_MODEL, 'gemini-4-argon', 'gemini-4-hydrogen'])
+  );
 
-  for (let recoveryAttempt = 0; recoveryAttempt <= 3; recoveryAttempt++) {
+  for (let recoveryAttempt = 0; recoveryAttempt <= 5; recoveryAttempt++) {
     if (params.signal.aborted) throw new Error('ABORTED');
+
+    // Rotate across specialist & flagship models on retries so single-model congestion NEVER halts the pipeline!
+    const activeModelId =
+      recoveryAttempt === 0
+        ? assignedSpecialistId
+        : fallbackCascadeModels[recoveryAttempt % fallbackCascadeModels.length];
+    const activeEntry = getToolModelEntry(activeModelId);
+    const resolvedThinkingLevel =
+      activeModelId === 'gemini-3.1-flash-lite'
+        ? ThinkingLevel.LOW
+        : recoveryAttempt >= 2 || activeModelId === 'gemini-4-hydrogen'
+          ? ThinkingLevel.MEDIUM
+          : params.depth === 'standard'
+            ? ThinkingLevel.MEDIUM
+            : ThinkingLevel.HIGH;
 
     let attemptRawChunk = '';
     let lastFlushTime = 0;
@@ -2352,7 +2988,6 @@ async function executeBatchPassWithAutoRecovery(params: {
       : { consolidatedBriefBlock: '', memoryContextBlock: '' };
 
     const tailAnchor = baseMarkdown.slice(-480);
-    // Compact 16k window on intra-round continuation cuts redundant prompt tokens dramatically while keeping full local coherence!
     const windowedCurrentBatchSoFar = isCont
       ? windowLongMarkdownContext(baseMarkdown, 16_000)
       : '';
@@ -2361,43 +2996,58 @@ async function executeBatchPassWithAutoRecovery(params: {
       ? `[文档总标题]: ${params.plan.documentTitle} (${params.plan.courseCode})
 [扩展编纂总纲]: ${params.plan.expandedPrompt}
 ${consolidatedBriefBlock}
-[自适应满载轮次总览]: 当前执行第 ${params.batchSpec.batchIndex}/${params.plan.batches.length} 轮：《${params.batchSpec.title}》
-${params.previousBatchesOutline ? `[前序已完成轮次结构提要]:\n${params.previousBatchesOutline}\n` : ''}
-${memoryContextBlock ? `${memoryContextBlock}\n\n` : ''}[本轮必须满载完整覆盖的小节清单]:
+[多模型模块化精编总览]: 当前执行第 ${params.batchSpec.batchIndex}/${params.plan.batches.length} 模块：《${params.batchSpec.title}》（执笔模型：${activeEntry.codeName}）
+${params.previousBatchesOutline ? `[前序已完成模块结构提要（严禁重复，自然衔接后文）]:\n${params.previousBatchesOutline}\n` : ''}
+${memoryContextBlock ? `${memoryContextBlock}\n\n` : ''}[本模块必须高质完整覆盖的小节清单]:
 ${params.batchSpec.sections.map((s, i) => `${i + 1}. ${s}`).join('\n')}
-[本轮范围与单次极限目标]: ${params.batchSpec.scopeSummary}（请充分利用单次调用极限详尽展开，目标篇幅约 ${params.batchSpec.targetWords.toLocaleString()} 字）
+[本模块范围与质量甜点目标]: ${params.batchSpec.scopeSummary}（适度单次容量目标约 ${params.batchSpec.targetWords.toLocaleString()} 字，优先保证推导严谨度与彩色知识框排版质量，最后将自动与前后模块拼接）
 请直接输出正式学术 Markdown 正文，全部完成后在末尾单独一行输出 [[BATCH_COMPLETE]]。`
       : `[高能效无缝断点续写指令]
-你正在续写《${params.plan.documentTitle}》的第 ${params.batchSpec.batchIndex}/${params.plan.batches.length} 轮（${params.batchSpec.title}）。
-本轮须完整覆盖的小节：${params.batchSpec.sections.join('、')}。
+你正在续写《${params.plan.documentTitle}》的第 ${params.batchSpec.batchIndex}/${params.plan.batches.length} 模块（${params.batchSpec.title}）。
+本模块须完整覆盖的小节：${params.batchSpec.sections.join('、')}。
 ${consolidatedBriefBlock}
 ${memoryContextBlock ? `\n${memoryContextBlock}\n` : ''}
-以下是本轮目前已生成内容的精简衔接窗口（总已写 ${baseMarkdown.length.toLocaleString()} 字符）：
---- 本轮已生成正文窗口开始 ---
+以下是本模块目前已生成内容的精简衔接窗口（总已写 ${baseMarkdown.length.toLocaleString()} 字符）：
+--- 本模块已生成正文窗口开始 ---
 ${windowedCurrentBatchSoFar}
---- 本轮已生成正文窗口结束 ---
+--- 本模块已生成正文窗口结束 ---
 
-请严格紧接在以下末尾断点文字之后无缝继续撰写（严禁重复已输出的标题或句子，若上一句或公式未写完请直接补全并继续完成本轮剩余小节）：
+请严格紧接在以下末尾断点文字之后无缝继续撰写（严禁重复已输出的标题或句子，若上一句、公式或 \`:::\` 填色框未闭合请直接补全并继续完成本模块剩余小节）：
 断点锚点：「${tailAnchor}」
 
-当且仅当本轮剩余所有小节与整合要求全部撰写完毕后，在末尾单独一行输出 [[BATCH_COMPLETE]]。`;
+当且仅当本模块剩余所有小节与整合要求全部撰写完毕后，在末尾单独一行输出 [[BATCH_COMPLETE]]。`;
 
     try {
       const stream = await ai.models.generateContentStream({
-        model: CARBON_MODEL,
+        model: activeModelId,
         contents: { parts: [...attachmentParts, { text: taskPrompt }] as never },
         config: {
           systemInstruction,
           thinkingConfig: {
-            thinkingLevel: params.depth === 'standard' ? ThinkingLevel.MEDIUM : ThinkingLevel.HIGH,
+            thinkingLevel: resolvedThinkingLevel,
           },
           ...(hasFallbackUnscrapedWebUrl ? { tools: [{ urlContext: {} }] } : {}),
         },
       });
 
       let finishReason = 'STOP';
+      const iterator = stream[Symbol.asyncIterator]();
+      let isFirstChunk = true;
 
-      for await (const rawChunk of stream) {
+      while (true) {
+        const chunkTimeoutMs = isFirstChunk ? 85_000 : 45_000;
+        const iterRes = await Promise.race([
+          iterator.next(),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`STREAM_CHUNK_INACTIVITY_TIMEOUT_${chunkTimeoutMs}MS`)),
+              chunkTimeoutMs
+            )
+          ),
+        ]);
+        if (iterRes.done) break;
+        isFirstChunk = false;
+        const rawChunk = iterRes.value;
         if (params.signal.aborted) throw new Error('ABORTED');
         const chunk = rawChunk as GenerateContentResponse;
         if (chunk.usageMetadata) {
@@ -2429,7 +3079,9 @@ ${windowedCurrentBatchSoFar}
               params.jobId,
               (prev) => {
                 const nextBatches = prev.batches.map((b, idx) =>
-                  idx === params.batchIdx ? { ...b, markdownContent: liveMerged } : b
+                  idx === params.batchIdx
+                    ? { ...b, modelUsed: activeModelId, markdownContent: liveMerged }
+                    : b
                 );
                 return {
                   ...prev,
@@ -2455,7 +3107,12 @@ ${windowedCurrentBatchSoFar}
       }
 
       if (latestChunkWithUsage) {
-        addMeasuredUsageToJob(params.jobId, latestChunkWithUsage);
+        addMeasuredUsageToJob(
+          params.jobId,
+          latestChunkWithUsage,
+          activeModelId,
+          activeEntry.workflowStages[0]
+        );
       }
 
       const finalMerged = isCont
@@ -2467,6 +3124,7 @@ ${windowedCurrentBatchSoFar}
         rawPassOutput: hasSentinel ? `${finalMerged}\n${BATCH_COMPLETE_MARKER}` : finalMerged,
         mergedCleanText: finalMerged,
         finishReason,
+        modelUsed: activeModelId,
       };
     } catch (err) {
       if (params.signal.aborted || (err instanceof Error && err.message === 'ABORTED')) {
@@ -2480,7 +3138,9 @@ ${windowedCurrentBatchSoFar}
           const metrics = countAcademicMetrics(fullMd);
           updateJobState(params.jobId, (prev) => {
             const nextBatches = prev.batches.map((b, idx) =>
-              idx === params.batchIdx ? { ...b, markdownContent: savedCancel } : b
+              idx === params.batchIdx
+                ? { ...b, modelUsed: activeModelId, markdownContent: savedCancel }
+                : b
             );
             return {
               ...prev,
@@ -2515,7 +3175,9 @@ ${windowedCurrentBatchSoFar}
         const metrics = countAcademicMetrics(fullMd);
         updateJobState(params.jobId, (prev) => {
           const nextBatches = prev.batches.map((b, idx) =>
-            idx === params.batchIdx ? { ...b, markdownContent: baseMarkdown } : b
+            idx === params.batchIdx
+              ? { ...b, modelUsed: activeModelId, markdownContent: baseMarkdown }
+              : b
           );
           return {
             ...prev,
@@ -2536,7 +3198,14 @@ ${windowedCurrentBatchSoFar}
       }
 
       const info = formatGeminiError(err);
-      if ((!info.isTransient && attemptRawChunk.trim().length === 0) || recoveryAttempt === 3) {
+      if (
+        !info.isTransient &&
+        String(err).includes('API_KEY_INVALID') &&
+        attemptRawChunk.trim().length === 0
+      ) {
+        throw err;
+      }
+      if (recoveryAttempt === 5) {
         throw err;
       }
 
@@ -2550,7 +3219,9 @@ ${windowedCurrentBatchSoFar}
         ),
       }));
 
-      await new Promise((r) => setTimeout(r, 2000 * Math.pow(2, recoveryAttempt)));
+      await new Promise((r) =>
+        setTimeout(r, Math.min(8000, 1400 * Math.pow(1.7, recoveryAttempt)))
+      );
     }
   }
 
@@ -2618,6 +3289,7 @@ async function runDetachedPipelineWorker(params: {
         title: b.title,
         volumeId: b.volumeId,
         volumeIndex: b.volumeIndex,
+        modelUsed: b.assignedModelId || CARBON_MODEL,
         status: 'pending',
         continuationCount: 0,
         autoRetryCount: 0,
@@ -2634,6 +3306,8 @@ async function runDetachedPipelineWorker(params: {
       job = updateJobState(jobId, (prev) => ({
         ...prev,
         stage: 'executing',
+        colorTheme: activePlan?.colorTheme || prev.colorTheme || 'academic_blue',
+        isStitchedAndPolished: false,
         plan: activePlan,
         batches: initialBatches,
         outputVolumes: initialVolumes,
@@ -2654,7 +3328,7 @@ async function runDetachedPipelineWorker(params: {
       await syncLiveCheckpointToDrive(jobId);
     }
 
-    // PHASE 2: Executing Adaptive Rounds (dynamically reconciles queued supplements & compiles completed volumes incrementally!)
+    // PHASE 2: Executing Multi-Model Modules + Nano Banana Figures + Seamless Final Stitching
     if (params.resumePhase !== 'archiving' && activePlan) {
       currentStageForError = 'executing';
       updateJobState(jobId, (prev) => ({
@@ -2680,7 +3354,6 @@ async function runDetachedPipelineWorker(params: {
       for (let i = startIdx; ; i++) {
         if (controller.signal.aborted) throw new Error('ABORTED');
 
-        // Dynamically consolidate & replan remaining pending rounds / volumes if user submitted new requirements!
         const checkQueuedBeforeRound = (jobsMap.get(jobId)?.supplementalDirectives || []).some(
           (d) => d.status === 'queued'
         );
@@ -2705,17 +3378,30 @@ async function runDetachedPipelineWorker(params: {
               const nextIdx = activePlan.batches.length + 1;
               const singleCallWords = SINGLE_CALL_TARGET_WORDS_BY_DEPTH[liveJob.depth];
               const lastVol = activePlan.volumes?.[activePlan.volumes.length - 1];
+              const suppSections = ['补充要求专项展开与严密推导', '增补资料解析与综合修正'];
+              const routed = routeSpecialistModelForBatch({
+                batchIndex: nextIdx,
+                totalBatches: nextIdx,
+                title: `动态整合补充模块（第 ${nextIdx} 模块）`,
+                scopeSummary: stillQueued.map((u) => u.text).join('；'),
+                sections: suppSections,
+                mode: liveJob.mode,
+                volumeRole: lastVol?.role,
+              });
               const suppSpec: TaskBatchSpec = {
                 batchIndex: nextIdx,
-                title: `动态整合补充专轮（第 ${nextIdx} 轮）`,
+                title: `动态整合补充模块（第 ${nextIdx} 模块）`,
                 scopeSummary:
                   stillQueued.map((u) => u.text).join('；') || '融合实时补充附件进行增补完善',
-                sections: ['补充要求专项展开与严密推导', '增补资料解析与综合修正'],
-                estimatedPages: Math.ceil(singleCallWords / 850),
+                sections: suppSections,
+                estimatedPages: Math.max(4, Math.ceil(singleCallWords / 650)),
                 targetWords: singleCallWords,
                 includeAnswerKey: liveJob.mode === 'workbook',
                 volumeId: lastVol?.volumeId || 'vol-1',
                 volumeIndex: lastVol?.volumeIndex || 1,
+                assignedModelId: routed.assignedModelId,
+                specialistRole: routed.specialistRole,
+                dispatchReason: routed.dispatchReason,
                 isSupplementalBatch: true,
               };
               const nextPlan: ExpandedPlan = {
@@ -2733,6 +3419,7 @@ async function runDetachedPipelineWorker(params: {
                     title: suppSpec.title,
                     volumeId: suppSpec.volumeId,
                     volumeIndex: suppSpec.volumeIndex,
+                    modelUsed: suppSpec.assignedModelId,
                     status: 'pending',
                     continuationCount: 0,
                     autoRetryCount: 0,
@@ -2773,6 +3460,7 @@ async function runDetachedPipelineWorker(params: {
                   ...b,
                   volumeId: b.volumeId || batchSpec.volumeId,
                   volumeIndex: b.volumeIndex || batchSpec.volumeIndex,
+                  modelUsed: batchSpec.assignedModelId || b.modelUsed || CARBON_MODEL,
                   status: workingMarkdown ? 'continuing' : 'running',
                   startedAt: b.startedAt || new Date().toISOString(),
                   errorMessage: undefined,
@@ -2796,7 +3484,7 @@ async function runDetachedPipelineWorker(params: {
           .slice(0, i)
           .map(
             (pb) =>
-              `- 第 ${pb.batchIndex} 轮《${pb.title}》(${pb.volumeId || 'vol-1'})：已涵盖 ${pb.sections.join('、')}`
+              `- 第 ${pb.batchIndex} 模块《${pb.title}》(${pb.volumeId || 'vol-1'})：已涵盖 ${pb.sections.join('、')}`
           )
           .join('\n');
 
@@ -2816,6 +3504,7 @@ async function runDetachedPipelineWorker(params: {
           signal: controller.signal,
         });
 
+        let activeBatchModelUsed = firstPass.modelUsed;
         let evalCont = evaluateBatchContinuation(
           firstPass.rawPassOutput,
           firstPass.finishReason,
@@ -2847,6 +3536,7 @@ async function runDetachedPipelineWorker(params: {
             signal: controller.signal,
           });
 
+          activeBatchModelUsed = contPass.modelUsed;
           evalCont = evaluateBatchContinuation(
             contPass.rawPassOutput,
             contPass.finishReason,
@@ -2855,9 +3545,27 @@ async function runDetachedPipelineWorker(params: {
           workingMarkdown = evalCont.cleanText;
         }
 
+        // Generate Nano Banana illustrations assigned to this module & inject seamlessly!
+        let moduleGeneratedFigures: GeneratedFigureAsset[] =
+          currentBatchState?.generatedFigures || [];
+        const latestJobForImg = jobsMap.get(jobId);
+        if (
+          latestJobForImg?.autoGenerateFigures !== false &&
+          (batchSpec.visualFigures?.length || 0) > 0 &&
+          moduleGeneratedFigures.length === 0
+        ) {
+          moduleGeneratedFigures = await generateModuleFiguresServer({
+            jobId,
+            batchSpec,
+            signal: controller.signal,
+          });
+        }
+
+        workingMarkdown = injectGeneratedFiguresIntoModuleMarkdown(
+          workingMarkdown,
+          moduleGeneratedFigures
+        );
         batchOutputs[i] = workingMarkdown;
-        const combinedMd = batchOutputs.filter(Boolean).join('\n\n');
-        const metrics = countAcademicMetrics(combinedMd);
 
         const afterRoundJob = updateJobState(jobId, (prev) => {
           const nextBatches: BatchExecutionState[] = prev.batches.map((b, idx) =>
@@ -2866,6 +3574,8 @@ async function runDetachedPipelineWorker(params: {
                   ...b,
                   volumeId: b.volumeId || batchSpec.volumeId,
                   volumeIndex: b.volumeIndex || batchSpec.volumeIndex,
+                  modelUsed: activeBatchModelUsed,
+                  generatedFigures: moduleGeneratedFigures,
                   status: 'completed',
                   continuationCount,
                   markdownContent: workingMarkdown,
@@ -2874,13 +3584,30 @@ async function runDetachedPipelineWorker(params: {
                 }
               : b
           );
+
+          const stitchedSoFar = stitchModularSectionsIntoDocument({
+            modules: nextBatches
+              .filter((b) => b.markdownContent.trim().length > 0)
+              .map((b) => ({
+                batchIndex: b.batchIndex,
+                markdownContent: b.markdownContent,
+                generatedFigures: b.generatedFigures,
+              })),
+          });
+          const metrics = countAcademicMetrics(stitchedSoFar);
+
+          const mergedJobFigsMap = new Map<string, GeneratedFigureAsset>();
+          for (const f of prev.generatedFigures || []) mergedJobFigsMap.set(f.figureId, f);
+          for (const f of moduleGeneratedFigures) mergedJobFigsMap.set(f.figureId, f);
+
           return {
             ...prev,
             updatedAt: new Date().toISOString(),
-            compiledMarkdown: combinedMd,
+            compiledMarkdown: stitchedSoFar,
             charCount: metrics.charCount,
             formulaCount: metrics.formulaCount,
             estimatedPages: metrics.estimatedPages,
+            generatedFigures: Array.from(mergedJobFigsMap.values()),
             batches: nextBatches,
             outputVolumes: computeVolumeArtifactsFromBatches({
               plan: prev.plan,
@@ -2892,8 +3619,7 @@ async function runDetachedPipelineWorker(params: {
           };
         });
 
-        // Incremental Per-Volume PDF Pre-Compilation: if this round completed an entire independent volume,
-        // pre-compile its PDF immediately in background so user can download Vol. 1 while Vol. 2/3 generates!
+        // Incremental Per-Volume PDF Pre-Compilation
         if (
           afterRoundJob &&
           afterRoundJob.outputVolumes &&
@@ -2908,20 +3634,27 @@ async function runDetachedPipelineWorker(params: {
               v.compiledMarkdown.trim().length > 0
           );
           if (justFinishedVol) {
-            const liveToken = resolveDriveToken(jobId, afterRoundJob.ownerEmail);
-            const builtVolBuf = await compileServerPdfBuffer(
-              afterRoundJob,
-              liveToken,
-              true,
-              justFinishedVol
-            );
-            if (builtVolBuf) {
-              updateJobState(jobId, (prev) => ({
-                ...prev,
-                outputVolumes: prev.outputVolumes?.map((v) =>
-                  v.volumeId === justFinishedVol.volumeId ? { ...v, serverPdfReady: true } : v
-                ),
-              }));
+            try {
+              const liveToken = resolveDriveToken(jobId, afterRoundJob.ownerEmail);
+              const builtVolBuf = await compileServerPdfBuffer(
+                afterRoundJob,
+                liveToken,
+                true,
+                justFinishedVol
+              );
+              if (builtVolBuf) {
+                updateJobState(jobId, (prev) => ({
+                  ...prev,
+                  outputVolumes: prev.outputVolumes?.map((v) =>
+                    v.volumeId === justFinishedVol.volumeId ? { ...v, serverPdfReady: true } : v
+                  ),
+                }));
+              }
+            } catch (volPdfErr) {
+              console.warn(
+                `[Incremental Volume PDF] Deferred ${justFinishedVol.volumeId} to Phase 3:`,
+                volPdfErr
+              );
             }
           }
         }
@@ -2930,20 +3663,38 @@ async function runDetachedPipelineWorker(params: {
       }
     }
 
-    // PHASE 3: Server-Side PDF Compilation (Compiles all independent volume PDFs when multi-volume!)
+    // PHASE 3: Final Master Modular Stitching + Server-Side PDF Compilation
     currentStageForError = 'compiling_pdf';
-    const readyJob = updateJobState(jobId, (prev) => ({
-      ...prev,
-      stage: 'compiling_pdf',
-      outputVolumes: computeVolumeArtifactsFromBatches({
-        plan: prev.plan,
-        batches: prev.batches,
-        existingVolumes: prev.outputVolumes,
-        defaultMode: prev.mode,
-        jobStage: 'compiling_pdf',
-      }),
-      updatedAt: new Date().toISOString(),
-    }))!;
+    const readyJob = updateJobState(jobId, (prev) => {
+      const masterStitched = stitchModularSectionsIntoDocument({
+        modules: prev.batches
+          .filter((b) => b.markdownContent.trim().length > 0)
+          .map((b) => ({
+            batchIndex: b.batchIndex,
+            markdownContent: b.markdownContent,
+            generatedFigures: b.generatedFigures,
+          })),
+      });
+      const finalMd = masterStitched || prev.compiledMarkdown;
+      const finalMetrics = countAcademicMetrics(finalMd);
+      return {
+        ...prev,
+        stage: 'compiling_pdf',
+        isStitchedAndPolished: true,
+        compiledMarkdown: finalMd,
+        charCount: finalMetrics.charCount,
+        formulaCount: finalMetrics.formulaCount,
+        estimatedPages: finalMetrics.estimatedPages,
+        outputVolumes: computeVolumeArtifactsFromBatches({
+          plan: prev.plan,
+          batches: prev.batches,
+          existingVolumes: prev.outputVolumes,
+          defaultMode: prev.mode,
+          jobStage: 'compiling_pdf',
+        }),
+        updatedAt: new Date().toISOString(),
+      };
+    })!;
 
     const userCloudCfg = getUserCloudConfig(readyJob.ownerEmail);
     const driveToken = resolveDriveToken(jobId, readyJob.ownerEmail);
@@ -2958,31 +3709,60 @@ async function runDetachedPipelineWorker(params: {
     );
 
     let anyPdfCompiled = false;
+    let pdfBuffer: Buffer | null = null;
+    const compiledVolumeBuffers = new Map<string, Buffer>();
+
     if (isMultiVolOutput && readyJob.outputVolumes) {
       for (const vol of readyJob.outputVolumes) {
         if (!vol.compiledMarkdown.trim()) continue;
-        const alreadyCached = getServerPdfPath(jobId, vol.volumeId);
-        const volBuf = alreadyCached
-          ? fs.readFileSync(alreadyCached)
-          : await compileServerPdfBuffer(readyJob, driveToken, shouldCacheLocally, vol);
-        if (volBuf) {
-          anyPdfCompiled = true;
-          updateJobState(jobId, (prev) => ({
-            ...prev,
-            outputVolumes: prev.outputVolumes?.map((v) =>
-              v.volumeId === vol.volumeId
-                ? { ...v, status: 'completed', serverPdfReady: true }
-                : v
-            ),
-          }));
+        try {
+          const alreadyCached = getServerPdfPath(jobId, vol.volumeId);
+          const volBuf = alreadyCached
+            ? fs.readFileSync(alreadyCached)
+            : await compileServerPdfBuffer(readyJob, driveToken, shouldCacheLocally, vol);
+          if (volBuf) {
+            anyPdfCompiled = true;
+            compiledVolumeBuffers.set(vol.volumeId, volBuf);
+            updateJobState(jobId, (prev) => ({
+              ...prev,
+              outputVolumes: prev.outputVolumes?.map((v) =>
+                v.volumeId === vol.volumeId
+                  ? { ...v, status: 'completed', serverPdfReady: true }
+                  : v
+              ),
+            }));
+          }
+        } catch (volErr) {
+          console.warn(
+            `[Phase 3 Volume PDF] On-demand compilation will serve ${vol.volumeId}:`,
+            volErr
+          );
         }
       }
     }
 
-    const pdfBuffer = await compileServerPdfBuffer(readyJob, driveToken, shouldCacheLocally);
-    if (pdfBuffer) {
-      anyPdfCompiled = true;
+    if (shouldCompileMergedFullPdfInWorker(readyJob.outputVolumes?.length || 0)) {
+      try {
+        pdfBuffer = await compileServerPdfBuffer(readyJob, driveToken, shouldCacheLocally);
+        if (pdfBuffer) {
+          anyPdfCompiled = true;
+        }
+      } catch (fullPdfErr) {
+        console.warn('[Phase 3 Full PDF] On-demand compilation fallback:', fullPdfErr);
+      }
     }
+
+    const persistFallbackBuffersToLocalCache = () => {
+      if (pdfBuffer && !getServerPdfPath(jobId)) {
+        fs.writeFileSync(path.join(PDF_CACHE_DIR, `${jobId}.pdf`), pdfBuffer);
+      }
+      for (const [volId, vBuf] of compiledVolumeBuffers.entries()) {
+        if (!getServerPdfPath(jobId, volId)) {
+          const safeVolId = volId.replace(/[^a-zA-Z0-9_-]/g, '_');
+          fs.writeFileSync(path.join(PDF_CACHE_DIR, `${jobId}__${safeVolId}.pdf`), vBuf);
+        }
+      }
+    };
 
     // Reconcile actual measured token consumption into user's billing & 6h/weekly usage ledger
     if (readyJob.billing?.actualTotalTokens) {
@@ -3028,9 +3808,7 @@ async function runDetachedPipelineWorker(params: {
           failedStage: undefined,
         }));
       } catch (driveErr) {
-        if (pdfBuffer && !getServerPdfPath(jobId)) {
-          fs.writeFileSync(path.join(PDF_CACHE_DIR, `${jobId}.pdf`), pdfBuffer);
-        }
+        persistFallbackBuffersToLocalCache();
         const dMsg = driveErr instanceof Error ? driveErr.message : String(driveErr);
         updateJobState(jobId, (prev) => ({
           ...prev,
@@ -3049,9 +3827,7 @@ async function runDetachedPipelineWorker(params: {
         }));
       }
     } else {
-      if (pdfBuffer && !getServerPdfPath(jobId)) {
-        fs.writeFileSync(path.join(PDF_CACHE_DIR, `${jobId}.pdf`), pdfBuffer);
-      }
+      persistFallbackBuffersToLocalCache();
       updateJobState(jobId, (prev) => ({
         ...prev,
         stage: 'completed',
@@ -3122,6 +3898,9 @@ export function startNewDetachedJob(params: {
   mode: DocMode;
   depth: DepthPreset;
   volumeSplitMode?: VolumeSplitMode;
+  pageOrientation?: PageOrientationMode;
+  colorTheme?: ColorPaletteTheme;
+  autoGenerateFigures?: boolean;
   rawUserPrompt: string;
   customRootFolder: string;
   autoArchiveDrive: boolean;
@@ -3137,6 +3916,9 @@ export function startNewDetachedJob(params: {
   const rootFolder =
     params.customRootFolder.trim() || userCloudCfg.driveRootFolder || 'Carbon 学术归档';
   const volumeSplitMode: VolumeSplitMode = params.volumeSplitMode || 'auto';
+  const pageOrientation: PageOrientationMode = params.pageOrientation || 'auto';
+  const colorTheme: ColorPaletteTheme = params.colorTheme || 'academic_blue';
+  const autoGenerateFigures = params.autoGenerateFigures ?? true;
 
   if (params.driveToken) {
     registerDriveToken(params.driveToken, jobId, ownerEmail);
@@ -3161,6 +3943,7 @@ export function startNewDetachedJob(params: {
     id: jobId,
     createdAt: nowIso,
     updatedAt: nowIso,
+    lastHeartbeatAt: nowIso,
     ownerEmail,
     ownerUid: params.ownerUid,
     clientDeviceId: params.clientDeviceId,
@@ -3172,6 +3955,13 @@ export function startNewDetachedJob(params: {
     mode: params.mode,
     depth: params.depth,
     volumeSplitMode,
+    pageOrientation,
+    colorTheme,
+    autoGenerateFigures,
+    isStitchedAndPolished: false,
+    generatedFigures: [],
+    modelUsageBreakdown: [],
+    multiModelTokenCostSavingsPct: 0,
     rawUserPrompt: params.rawUserPrompt.trim(),
     customRootFolder: rootFolder,
     autoArchiveDrive: params.autoArchiveDrive,
@@ -3223,8 +4013,8 @@ export function startNewDetachedJob(params: {
 }
 
 /**
- * Plans unbounded adaptive continuation/expansion rounds at the end of an already COMPLETED document
- * using Gemini 4 Carbon with full long-context comprehension of the existing compiledMarkdown.
+ * Plans unbounded adaptive continuation/expansion modules at the end of an already COMPLETED document
+ * using Gemini 4 Carbon with full long-context comprehension and specialist model routing.
  */
 async function planInPlaceExpansionBatchesServer(params: {
   job: PipelineJob;
@@ -3249,16 +4039,16 @@ async function planInPlaceExpansionBatchesServer(params: {
 
   const systemInstruction = `你是《${
     params.job.plan?.documentTitle || '学术专著'
-  }》的首席主编，正在基于已完成的全书正文进行【任务完成后无缝扩编续写】。
+  }》的首席主编（Gemini 4 Carbon），正在基于已完成的全书正文进行【任务完成后无缝扩编续写】。
 请严格阅读已完成正文的目录骨架、末尾定理/例题/习题编号与符号约定：
-1. 充分利用单次调用极限（每轮目标约 ${singleCallWords.toLocaleString()} 字），**不要固定轮次上限**，需要多少轮生成就拆分成多少轮！
-2. 新轮次的章节号、定理号、例题号或习题编号必须严格顺延已完成正文末尾编号（绝不重复已写内容）。
+1. 控制每个新增模块的单次输出在质量甜点区间（每模块约 ${singleCallWords.toLocaleString()} 字），**不要固定模块轮次上限**，需要多少模块就拆分成多少模块，并为每个模块指派最适配专精模型（\`gemini-4-carbon\` / \`gemini-4-argon\` / \`gemini-4-hydrogen\` / \`gemini-3.1-flash-lite\`）！
+2. 新模块的章节号、定理号、例题号或习题编号必须严格顺延已完成正文末尾编号（绝不重复已写内容）。
 3. 若用户在本次扩展要求中明确提出输出新的独立文件/独立答案解析册（检测：${splitIntent.shouldSplitVolumes ? splitIntent.reasonSummary : '默认合编进现有主卷或最后分册'}），可在 \`createSeparateVolume = true\` 时定义一个新的独立分册。`;
 
   const promptText = `[已完成文档标题]: ${params.job.plan?.documentTitle || ''} (${
     params.job.plan?.courseCode || 'CARBON'
   })
-[已完成总字数]: ${params.job.charCount.toLocaleString()} 字 · 已完成轮次数: ${startBatchNumber - 1}
+[已完成总字数]: ${params.job.charCount.toLocaleString()} 字 · 已完成模块数: ${startBatchNumber - 1}
 [已完成章节总览]: ${ledger.headings.join(' | ') || '见正文'}
 [已完成末尾编号锚点]: ${ledger.lastNumberedAnchors.slice(-12).join(' ； ') || '顺延前文'}
 [用户本次继续扩展任务要求]:
@@ -3268,7 +4058,7 @@ ${params.expansionPrompt.trim() || '请在现有已完成内容基础上继续�
 ${windowedExisting}
 --- 已完成文档长上下文窗口结束 ---
 
-请输出本次无缝扩编的新增轮次规划 JSON。`;
+请输出本次无缝扩编的新增模块规划 JSON。`;
 
   const response = await ai.models.generateContent({
     model: CARBON_MODEL,
@@ -3296,6 +4086,8 @@ ${windowedExisting}
                 estimatedPages: { type: Type.INTEGER },
                 targetWords: { type: Type.INTEGER },
                 includeAnswerKey: { type: Type.BOOLEAN },
+                assignedModelId: { type: Type.STRING },
+                dispatchReason: { type: Type.STRING },
               },
               required: [
                 'title',
@@ -3313,7 +4105,7 @@ ${windowedExisting}
     },
   });
 
-  addMeasuredUsageToJob(params.job.id, response);
+  addMeasuredUsageToJob(params.job.id, response, CARBON_MODEL, '长上下文扩编规划与模型路由');
   const raw = (response.text ?? '{}').trim();
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw) as Record<string, unknown>;
@@ -3352,39 +4144,81 @@ ${windowedExisting}
     newVolumeSpec?.volumeIndex ||
     existingVols[existingVols.length - 1]?.volumeIndex ||
     1;
+  const targetVolRole =
+    newVolumeSpec?.role || existingVols[existingVols.length - 1]?.role;
 
   const rawList = Array.isArray(parsed.batches) && parsed.batches.length > 0 ? parsed.batches : [];
   const newBatches: TaskBatchSpec[] =
     rawList.length > 0
-      ? (rawList as Array<Record<string, unknown>>).map((b, idx) => ({
-          batchIndex: startBatchNumber + idx,
-          title: String(b.title || `后续扩展专轮（第 ${startBatchNumber + idx} 轮）`),
-          scopeSummary: String(b.scopeSummary || params.expansionPrompt),
-          sections: Array.isArray(b.sections) ? b.sections.map(String) : ['后续深度扩展章节'],
-          estimatedPages: Math.max(4, Number(b.estimatedPages) || Math.ceil(singleCallWords / 850)),
-          targetWords: Math.max(4000, Number(b.targetWords) || singleCallWords),
-          includeAnswerKey: Boolean(
-            b.includeAnswerKey ??
-              (newVolumeSpec?.role === 'solutions_manual' || params.job.mode === 'workbook')
-          ),
-          volumeId: targetVolId,
-          volumeIndex: targetVolIdx,
-          isExpansionBatch: true,
-        }))
-      : [
-          {
-            batchIndex: startBatchNumber,
-            title: `后续深度扩展专轮（第 ${startBatchNumber} 轮）`,
-            scopeSummary: params.expansionPrompt || '基于已完成内容继续深度扩展新章节与高阶例题',
-            sections: ['后续进阶核心理论与证明', '综合拔高例题与拓展训练'],
-            estimatedPages: Math.ceil(singleCallWords / 850),
-            targetWords: singleCallWords,
-            includeAnswerKey:
-              newVolumeSpec?.role === 'solutions_manual' || params.job.mode === 'workbook',
+      ? (rawList as Array<Record<string, unknown>>).map((b, idx) => {
+          const bTitle = String(b.title || `后续扩展模块（第 ${startBatchNumber + idx} 模块）`);
+          const bScope = String(b.scopeSummary || params.expansionPrompt);
+          const bSections = Array.isArray(b.sections)
+            ? b.sections.map(String)
+            : ['后续深度扩展章节'];
+          const routed = routeSpecialistModelForBatch({
+            batchIndex: startBatchNumber + idx,
+            totalBatches: startBatchNumber + rawList.length - 1,
+            title: bTitle,
+            scopeSummary: bScope,
+            sections: bSections,
+            mode: params.job.mode,
+            volumeRole: targetVolRole,
+            requestedModelId: b.assignedModelId ? String(b.assignedModelId) : undefined,
+            requestedReason: b.dispatchReason ? String(b.dispatchReason) : undefined,
+          });
+          const clampedWords = clampModuleWordsToQualitySweetSpot(
+            Number(b.targetWords) || singleCallWords,
+            params.depth
+          );
+          return {
+            batchIndex: startBatchNumber + idx,
+            title: bTitle,
+            scopeSummary: bScope,
+            sections: bSections,
+            estimatedPages: Math.max(4, Math.ceil(clampedWords / 650)),
+            targetWords: clampedWords,
+            includeAnswerKey: Boolean(
+              b.includeAnswerKey ??
+                (newVolumeSpec?.role === 'solutions_manual' || params.job.mode === 'workbook')
+            ),
             volumeId: targetVolId,
             volumeIndex: targetVolIdx,
+            assignedModelId: routed.assignedModelId,
+            specialistRole: routed.specialistRole,
+            dispatchReason: routed.dispatchReason,
             isExpansionBatch: true,
-          },
+          };
+        })
+      : [
+          (() => {
+            const fallbackSections = ['后续进阶核心理论与证明', '综合拔高例题与拓展训练'];
+            const routed = routeSpecialistModelForBatch({
+              batchIndex: startBatchNumber,
+              totalBatches: startBatchNumber,
+              title: `后续深度扩展模块（第 ${startBatchNumber} 模块）`,
+              scopeSummary: params.expansionPrompt,
+              sections: fallbackSections,
+              mode: params.job.mode,
+              volumeRole: targetVolRole,
+            });
+            return {
+              batchIndex: startBatchNumber,
+              title: `后续深度扩展模块（第 ${startBatchNumber} 模块）`,
+              scopeSummary: params.expansionPrompt || '基于已完成内容继续深度扩展新章节与高阶例题',
+              sections: fallbackSections,
+              estimatedPages: Math.max(4, Math.ceil(singleCallWords / 650)),
+              targetWords: singleCallWords,
+              includeAnswerKey:
+                newVolumeSpec?.role === 'solutions_manual' || params.job.mode === 'workbook',
+              volumeId: targetVolId,
+              volumeIndex: targetVolIdx,
+              assignedModelId: routed.assignedModelId,
+              specialistRole: routed.specialistRole,
+              dispatchReason: routed.dispatchReason,
+              isExpansionBatch: true,
+            };
+          })(),
         ];
 
   return {
@@ -3471,6 +4305,8 @@ export async function expandCompletedServerJob(params: {
       mode: targetMode,
       depth: params.depth || sourceJob.depth,
       volumeSplitMode: 'auto',
+      colorTheme: sourceJob.colorTheme || sourceJob.plan?.colorTheme || 'academic_blue',
+      autoGenerateFigures: sourceJob.autoGenerateFigures ?? true,
       rawUserPrompt: params.expansionPrompt.trim() || defaultDerivedPrompt,
       customRootFolder: sourceJob.customRootFolder,
       autoArchiveDrive: sourceJob.autoArchiveDrive,
@@ -3502,6 +4338,7 @@ export async function expandCompletedServerJob(params: {
     ...prev,
     stage: 'planning',
     serverPdfReady: false,
+    isStitchedAndPolished: false,
     errorMessage: undefined,
     failedStage: undefined,
     updatedAt: new Date().toISOString(),
@@ -3520,6 +4357,7 @@ export async function expandCompletedServerJob(params: {
     title: spec.title,
     volumeId: spec.volumeId,
     volumeIndex: spec.volumeIndex,
+    modelUsed: spec.assignedModelId,
     status: 'pending',
     continuationCount: 0,
     autoRetryCount: 0,
@@ -3684,6 +4522,8 @@ export function resumeDetachedJob(params: {
       customRootFolder: baseJob.customRootFolder,
       rawUserPrompt: baseJob.rawUserPrompt,
       multiVolumeDetection: splitDet,
+      pageOrientation: baseJob.pageOrientation,
+      directives: baseJob.supplementalDirectives,
     });
   }
 
@@ -3706,13 +4546,15 @@ export function resumeDetachedJob(params: {
         ? 'compiling_pdf'
         : 'executing';
 
+  const nowBeat = new Date().toISOString();
   const preparedJob: PipelineJob = {
     ...jobWithHydratedPlan,
     executionHost: 'server_cloud',
     stage: nextStage,
     failedStage: undefined,
     errorMessage: undefined,
-    updatedAt: new Date().toISOString(),
+    updatedAt: nowBeat,
+    lastHeartbeatAt: nowBeat,
     batches: descriptor.updatedBatches,
     consolidatedRequirements:
       baseJob.consolidatedRequirements ||

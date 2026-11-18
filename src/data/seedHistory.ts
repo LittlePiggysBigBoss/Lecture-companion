@@ -50,6 +50,14 @@ export const STARTER_TEMPLATES: StarterTemplate[] = [
     prompt:
       '制作一份高阶物理竞赛全套讲义，按章节拆分成数学基础与运动学、牛顿动力学与守恒律两份独立分册文件输出，并且所有例题和配套训练题的答案和详细解析另外一份独立文件输出，不要限制生成轮次，确保推导详尽。',
   },
+  {
+    id: 'landscape-ppt-rl',
+    label: '横版演示 PPT 版式 · 强化学习 MDP 与策略梯度课件',
+    mode: 'lecture_notes',
+    subjectHint: '机器学习与控制论',
+    prompt:
+      '整理一份强化学习马尔可夫决策过程 (MDP)、贝尔曼最优方程与策略梯度定理 (Policy Gradient) 的横版 PDF 讲义，调整成横版 PDF 可以当成 PPT 使用的版式，字体大小与结构适合课堂展示呈现，核心定理证明和典型算例完整详尽。',
+  },
 ];
 
 const SEED_SVD_MARKDOWN = `# 第一章 奇异值分解 (SVD) 的代数结构与几何直觉
@@ -58,9 +66,13 @@ const SEED_SVD_MARKDOWN = `# 第一章 奇异值分解 (SVD) 的代数结构与�
 
 在线性代数中，实对称矩阵 $A \\in \\mathbb{R}^{n \\times n}$ 享有优美的谱定理（Spectral Theorem）：存在正交矩阵 $Q$ 使得 $A = Q \\Lambda Q^T$。然而在数据科学、信号处理与现代机器学习中，观测矩阵往往是非方阵 $A \\in \\mathbb{R}^{m \\times n}$（例如包含 $m$ 个样本、$n$ 维特征的数据矩阵）。奇异值分解（Singular Value Decomposition, SVD）将正交对角化的思想推广到了**任意维度、任意秩**的实矩阵与复矩阵。
 
-> **定义 1.1（奇异值分解）** 设矩阵 $A \\in \\mathbb{R}^{m \\times n}$ 的秩为 $r = \\operatorname{rank}(A) \\le \\min(m, n)$。则存在正交矩阵 $U \\in \\mathbb{R}^{m \\times m}$（左奇异向量矩阵）与正交矩阵 $V \\in \\mathbb{R}^{n \\times n}$（右奇异向量矩阵），使得：
-> $$A = U \\Sigma V^T = \\sum_{i=1}^{r} \\sigma_i u_i v_i^T$$
-> 其中 $\\Sigma \\in \\mathbb{R}^{m \\times n}$ 仅在主对角线上有非零元素 $\\sigma_1 \\ge \\sigma_2 \\ge \\cdots \\ge \\sigma_r > 0$，其余元素全为 $0$。常数 $\\sigma_i$ 称为矩阵 $A$ 的**奇异值**。
+:::definition 定义 1.1（奇异值分解 SVD）
+设矩阵 $A \\in \\mathbb{R}^{m \\times n}$ 的秩为 $r = \\operatorname{rank}(A) \\le \\min(m, n)$。则存在正交矩阵 $U \\in \\mathbb{R}^{m \\times m}$（左奇异向量矩阵）与正交矩阵 $V \\in \\mathbb{R}^{n \\times n}$（右奇异向量矩阵），使得：
+
+$$A = U \\Sigma V^T = \\sum_{i=1}^{r} \\sigma_i u_i v_i^T$$
+
+其中 $\\Sigma \\in \\mathbb{R}^{m \\times n}$ 仅在主对角线上有非零元素 $\\sigma_1 \\ge \\sigma_2 \\ge \\cdots \\ge \\sigma_r > 0$，其余元素全为 $0$。常数 $\\sigma_i$ 称为矩阵 $A$ 的**奇异值**。
+:::
 
 ## 1.2 存在性严密证明与格拉姆矩阵联系
 
@@ -84,15 +96,23 @@ $$u_i^T u_j = \\frac{1}{\\sigma_i \\sigma_j} v_i^T (A^T A) v_j = \\frac{\\lambda
 | 紧凑 SVD (Thin SVD) | $U_n \\in \\mathbb{R}^{m\\times n}, \\Sigma_n \\in \\mathbb{R}^{n\\times n}, V \\in \\mathbb{R}^{n\\times n}$ | $O(m n^2)$ | QR 预处理回归、条件数数值稳定性分析 |
 | 截断 SVD (Truncated-$k$) | $U_k \\in \\mathbb{R}^{m\\times k}, \\Sigma_k \\in \\mathbb{R}^{k\\times k}, V_k \\in \\mathbb{R}^{n\\times k}$ | $O(m n k)$（随机化幂迭代） | 大规模推荐系统、PCA 降维、图像低秩去噪 |
 
+:::warning 易错辨析：特征值分解与奇异值分解的符号与正交性差异
+非对称方阵 $A$ 的特征值可能为负数甚至复数，且特征向量未必正交；而任意实矩阵 $A$ 的非零奇异值 $\\sigma_i = \\sqrt{\\lambda_i(A^T A)}$ **恒为严格正实数**，且左右奇异向量系 $\\{u_i\\}$ 与 $\\{v_i\\}$ 各自恒构成标准正交系。
+:::
+
 # 第二章 Eckart-Young-Mirsky 最优低秩近似定理与 PCA 应用
 
 ## 2.1 最优秩-$k$ 逼近定理与误差精确刻画
 
 在实际高维数据矩阵中，尾部微小奇异值往往对应观测噪声。截断前 $k$ 项秩一矩阵之和记为 $A_k = \\sum_{i=1}^{k} \\sigma_i u_i v_i^T$（其中 $k < r$）。
 
-> **定理 2.1（Eckart-Young-Mirsky 定理）** 对于任意秩不超过 $k$ 的矩阵 $B \\in \\mathbb{R}^{m \\times n}$（即 $\\operatorname{rank}(B) \\le k$），截断奇异值矩阵 $A_k$ 在谱范数（算子 2-范数）与 Frobenius 范数下均达到全局最小逼近误差：
-> $$\\min_{\\operatorname{rank}(B) \\le k} \\|A - B\\|_2 = \\|A - A_k\\|_2 = \\sigma_{k+1}$$
-> $$\\min_{\\operatorname{rank}(B) \\le k} \\|A - B\\|_F = \\|A - A_k\\|_F = \\sqrt{\\sum_{i=k+1}^{r} \\sigma_i^2}$$
+:::theorem 定理 2.1（Eckart-Young-Mirsky 最优低秩近似定理）
+对于任意秩不超过 $k$ 的矩阵 $B \\in \\mathbb{R}^{m \\times n}$（即 $\\operatorname{rank}(B) \\le k$），截断奇异值矩阵 $A_k$ 在谱范数（算子 2-范数）与 Frobenius 范数下均达到全局最小逼近误差：
+
+$$\\min_{\\operatorname{rank}(B) \\le k} \\|A - B\\|_2 = \\|A - A_k\\|_2 = \\sigma_{k+1}$$
+
+$$\\min_{\\operatorname{rank}(B) \\le k} \\|A - B\\|_F = \\|A - A_k\\|_F = \\sqrt{\\sum_{i=k+1}^{r} \\sigma_i^2}$$
+:::
 
 ### 谱范数下界证明（维数交集法）
 设任意矩阵 $B$ 满足 $\\operatorname{rank}(B) \\le k$，则其零空间维数满足 $\\dim \\mathcal{N}(B) = n - \\operatorname{rank}(B) \\ge n - k$。与此同时，张成子空间 $W = \\operatorname{span}\\{v_1, v_2, \\dots, v_{k+1}\\}$ 的维数为 $k + 1$。因为：
@@ -166,6 +186,28 @@ export function createInitialSeedJobs(): PipelineJob[] {
       updatedAt: '2026-11-15T18:24:12.000Z',
       mode: 'lecture_notes',
       depth: 'comprehensive',
+      colorTheme: 'academic_blue',
+      autoGenerateFigures: true,
+      isStitchedAndPolished: true,
+      multiModelTokenCostSavingsPct: 34,
+      modelUsageBreakdown: [
+        {
+          modelId: 'gemini-4-carbon',
+          codeName: 'Carbon',
+          calls: 2,
+          inputTokens: 4820,
+          outputTokens: 3460,
+          roleSummary: '总纲路由编排 + 第二章 Eckart-Young-Mirsky 压轴定理严密证明',
+        },
+        {
+          modelId: 'gemini-4-hydrogen',
+          codeName: 'Hydrogen',
+          calls: 1,
+          inputTokens: 3150,
+          outputTokens: 4680,
+          roleSummary: '第一章概念动机精讲、彩色定义/警示框填色排版与复杂度对照表',
+        },
+      ],
       rawUserPrompt: '写一份关于矩阵奇异值分解 SVD 与 Eckart-Young 低秩近似定理的课程讲义。',
       customRootFolder: 'Carbon 学术归档',
       autoArchiveDrive: true,
@@ -187,6 +229,13 @@ export function createInitialSeedJobs(): PipelineJob[] {
         archiveRootFolder: 'Carbon 学术归档',
         archiveSubjectFolder: '高等线性代数',
         suggestedFileName: 'MATH304_SVD与低秩近似深度讲义.pdf',
+        colorTheme: 'academic_blue',
+        autoGenerateFigures: true,
+        singleCallTargetWords: 4800,
+        adaptiveStrategyNote:
+          '采用质量优先适度单次容量（~4,800 字/模块），分 2 个高精模块独立编纂后无缝拼接合卷',
+        orchestrationSummary:
+          '主思考模型 Carbon 按板块特性分配模型：第 1 模块调度 Hydrogen 负责概念直觉、皇家蓝定义框与多维复杂度表格填色排版；第 2 模块由 Carbon 亲自执笔 Eckart-Young-Mirsky 定理维数交集法严密证明，综合节省约 34% Token 成本。',
         expandedPrompt:
           '将用户关于奇异值分解的简短请求系统扩写为两章研究生先修级讲义：第一章从对称矩阵谱定理出发自然引出任意矩阵 SVD 的代数构造，给出基于格拉姆矩阵特征向量的完整存在性证明，并对比完全/紧凑/截断三种分解形态的计算复杂度；第二章聚焦低秩矩阵近似，给出 Eckart-Young-Mirsky 定理在算子范数下的维数交集法完整证明及工程降维意义。',
         pedagogicalGoals: [
@@ -197,37 +246,47 @@ export function createInitialSeedJobs(): PipelineJob[] {
         batches: [
           {
             batchIndex: 1,
-            title: '第一章：SVD 代数存在性证明与三种矩阵分解对比',
-            scopeSummary: '一次性完整推导格拉姆矩阵正交特征基、奇异向量正交性验证及复杂度对照表',
+            title: '第一模块：SVD 概念动机、彩色定义框排版与三种分解复杂度对比',
+            scopeSummary: '完整推导格拉姆矩阵正交特征基、奇异向量正交性验证及彩色知识框/对照表排版',
             sections: ['1.1 从特征值分解到任意矩阵正交对角化', '1.2 存在性严密证明与分解形态对比'],
-            estimatedPages: 2,
-            targetWords: 1800,
+            estimatedPages: 4,
+            targetWords: 4600,
             includeAnswerKey: false,
+            assignedModelId: 'gemini-4-hydrogen',
+            specialistRole: 'conceptual_prose_and_color_layout',
+            dispatchReason:
+              'Carbon 调度 Hydrogen 高吞吐排版模型：负责概念导引、彩色定义/警示框填色排版与复杂度表（节省 72% Token 成本）',
           },
           {
             batchIndex: 2,
-            title: '第二章：Eckart-Young-Mirsky 低秩逼近定理与维数交集法证明',
-            scopeSummary: '完整呈现最优秩-k 逼近定理在谱范数与 Frobenius 范数下的表述及严密推导',
+            title: '第二模块：Eckart-Young-Mirsky 低秩逼近定理与维数交集法严密证明',
+            scopeSummary: '完整呈现最优秩-k 逼近定理在谱范数与 Frobenius 范数下的表述及无跳步推导',
             sections: ['2.1 最优秩-k 逼近定理与误差精确刻画', '2.2 谱范数下界维数交集法证明'],
-            estimatedPages: 2,
-            targetWords: 1600,
+            estimatedPages: 4,
+            targetWords: 4800,
             includeAnswerKey: false,
+            assignedModelId: 'gemini-4-carbon',
+            specialistRole: 'orchestration_and_proof',
+            dispatchReason:
+              'Carbon 主模型自留压轴证明模块：确保维数交集法与算子范数下界推导 100% 严密闭合',
           },
         ],
       },
       batches: [
         {
           batchIndex: 1,
-          title: '第一章：SVD 代数存在性证明与三种矩阵分解对比',
+          title: '第一模块：SVD 概念动机、彩色定义框排版与三种分解复杂度对比',
+          modelUsed: 'gemini-4-hydrogen',
           status: 'completed',
           continuationCount: 0,
           markdownContent: SEED_SVD_MARKDOWN.split('# 第二章')[0].trim(),
         },
         {
           batchIndex: 2,
-          title: '第二章：Eckart-Young-Mirsky 低秩逼近定理与维数交集法证明',
+          title: '第二模块：Eckart-Young-Mirsky 低秩逼近定理与维数交集法严密证明',
+          modelUsed: 'gemini-4-carbon',
           status: 'completed',
-          continuationCount: 1,
+          continuationCount: 0,
           markdownContent: '# 第二章' + SEED_SVD_MARKDOWN.split('# 第二章')[1],
         },
       ],
@@ -247,6 +306,28 @@ export function createInitialSeedJobs(): PipelineJob[] {
       mode: 'workbook',
       depth: 'comprehensive',
       volumeSplitMode: 'auto',
+      colorTheme: 'amber_olympiad',
+      autoGenerateFigures: true,
+      isStitchedAndPolished: true,
+      multiModelTokenCostSavingsPct: 33,
+      modelUsageBreakdown: [
+        {
+          modelId: 'gemini-4-carbon',
+          codeName: 'Carbon',
+          calls: 1,
+          inputTokens: 2180,
+          outputTokens: 1240,
+          roleSummary: '双分册结构规划与专精模型路由调度',
+        },
+        {
+          modelId: 'gemini-4-argon',
+          codeName: 'Argon',
+          calls: 2,
+          inputTokens: 6420,
+          outputTokens: 8960,
+          roleSummary: '正题题本分级命题 + 第 2 分册逐题分步演算与采分标准撰写',
+        },
+      ],
       rawUserPrompt:
         '出一套贝叶斯共轭先验与离散马尔可夫链平稳分布的精编练习题册，正题题本与详细评分标准答案另外一份独立文件输出。',
       customRootFolder: 'Carbon 学术归档',
@@ -289,6 +370,8 @@ export function createInitialSeedJobs(): PipelineJob[] {
         archiveRootFolder: 'Carbon 学术归档',
         archiveSubjectFolder: '概率论与数理统计',
         suggestedFileName: 'STAT312_贝叶斯与马尔可夫链练习题册.pdf',
+        colorTheme: 'amber_olympiad',
+        autoGenerateFigures: true,
         expandedPrompt:
           '将用户需求扩展为正题与解析独立成册的专业练习题集：第 1 分册为无剧透学生自测题本，涵盖 Beta-Binomial 共轭家族与非时间可逆马尔可夫链综合压轴题；第 2 分册为独立详解与评分标准册，逐题给出核匹配、细致平衡反例判别、线性方程组求解与 Kac 回访定理采分点。',
         pedagogicalGoals: [
@@ -297,9 +380,11 @@ export function createInitialSeedJobs(): PipelineJob[] {
           '准确识别非可逆马尔可夫链中的细致平衡陷阱并熟练求解平稳分布方程组',
         ],
         isMultiVolume: true,
-        singleCallTargetWords: 11500,
+        singleCallTargetWords: 4800,
         adaptiveStrategyNote:
-          '自适应拆分为 2 份独立 PDF 分册（题本卷 + 独立答案解析册），按真实体量动态编排满载轮次',
+          '采用质量优先适度单次容量（~4,800 字/模块），拆分为 2 份独立 PDF 分册（题本卷 + 独立答案解析册）',
+        orchestrationSummary:
+          'Carbon 主模型完成双分册结构规划后，按需调度数理命题与演算专精模型 Argon 分别完成第 1 分册梯度题本与第 2 分册逐题采分详解，提升推导精度并降低 33% Token 消耗。',
         volumes: [
           {
             volumeId: 'vol-1',
@@ -323,43 +408,53 @@ export function createInitialSeedJobs(): PipelineJob[] {
         batches: [
           {
             batchIndex: 1,
-            title: '第 1 分册满载生成：全册分级精选题干（基础共轭先验 + 压轴马尔可夫链）',
+            title: '第 1 分册精编模块：全册分级精选题干（基础共轭先验 + 压轴马尔可夫链）',
             scopeSummary: '完整输出学生卷全部题干与小问设问（不含答案解析）',
             sections: ['第一部分 基础巩固：Beta-Binomial 共轭推断题干', '第二部分 综合压轴：马尔可夫链平稳分布题干'],
-            estimatedPages: 2,
-            targetWords: 11500,
+            estimatedPages: 3,
+            targetWords: 4500,
             includeAnswerKey: false,
             volumeId: 'vol-1',
             volumeIndex: 1,
+            assignedModelId: 'gemini-4-argon',
+            specialistRole: 'stem_problem_derivation',
+            dispatchReason:
+              'Carbon 调度 Argon 数理命题专精模型：设计严谨边界条件与多梯度概率统计题干',
           },
           {
             batchIndex: 2,
-            title: '第 2 分册满载生成：全册逐题分步解析与评分标准专册',
+            title: '第 2 分册精编模块：全册逐题分步解析与评分标准专册',
             scopeSummary: '严格对齐第 1 分册题号，独立输出全部详细推导与按步给分标准',
             sections: ['题 1.1 分步解析与评分细则', '题 2.1 细致平衡判别与平稳分布完整求解'],
-            estimatedPages: 2,
-            targetWords: 11500,
+            estimatedPages: 4,
+            targetWords: 4800,
             includeAnswerKey: true,
             volumeId: 'vol-2',
             volumeIndex: 2,
+            assignedModelId: 'gemini-4-argon',
+            specialistRole: 'stem_problem_derivation',
+            dispatchReason:
+              'Carbon 调度 Argon 数理演算专精模型：逐题输出无跳步代数推导、细致平衡反例检验与采分点',
           },
         ],
       },
       batches: [
         {
           batchIndex: 1,
-          title: '第 1 分册满载生成：全册分级精选题干（基础共轭先验 + 压轴马尔可夫链）',
+          title: '第 1 分册精编模块：全册分级精选题干（基础共轭先验 + 压轴马尔可夫链）',
           volumeId: 'vol-1',
           volumeIndex: 1,
+          modelUsed: 'gemini-4-argon',
           status: 'completed',
           continuationCount: 0,
           markdownContent: SEED_WORKBOOK_MARKDOWN.replace(/> \*\*分步解析与评分标准\*\*[\s\S]*?(?=\n# |\n*$)/g, '').trim(),
         },
         {
           batchIndex: 2,
-          title: '第 2 分册满载生成：全册逐题分步解析与评分标准专册',
+          title: '第 2 分册精编模块：全册逐题分步解析与评分标准专册',
           volumeId: 'vol-2',
           volumeIndex: 2,
+          modelUsed: 'gemini-4-argon',
           status: 'completed',
           continuationCount: 0,
           markdownContent: `# 第 1 部分 基础巩固题组详解与评分标准\n\n### 题 1.1 标准解答\n\n${

@@ -93,10 +93,20 @@ export function evaluateBatchContinuation(
   const hitTokenLimit =
     normalizedReason.includes('MAX_TOKENS') || normalizedReason.includes('LENGTH');
 
-  // Check if an unclosed code fence or display math block remained open at the end
+  // Check if an unclosed code fence, display math block, or semantic ::: callout remained open
   const codeFenceCount = (cleanText.match(/```/g) || []).length;
   const displayMathCount = (cleanText.match(/\$\$/g) || []).length;
-  const hasUnclosedBlock = codeFenceCount % 2 !== 0 || displayMathCount % 2 !== 0;
+  const openCalloutCount = (
+    cleanText.match(/^:::(?:theorem|definition|example|warning|summary|proof|insight|callout)\b/gim) || []
+  ).length;
+  const closeCalloutCount = (cleanText.match(/^:::\s*$/gm) || []).length;
+  const hasUnclosedCallout = openCalloutCount > closeCalloutCount;
+  const endsMidClause = /[,，、：:；;=(（\[\\+\-*/<>]$/.test(cleanText.slice(-8).trim());
+  const hasUnclosedBlock =
+    codeFenceCount % 2 !== 0 ||
+    displayMathCount % 2 !== 0 ||
+    hasUnclosedCallout ||
+    endsMidClause;
 
   const shouldContinue =
     !hasCompleteMarker &&
@@ -245,6 +255,7 @@ export function splitMarkdownIntoSemanticBlocks(markdown: string): string[] {
   let buffer: string[] = [];
   let inCodeFence = false;
   let inMathBlock = false;
+  let inCalloutFence = false;
   let inTable = false;
 
   const flush = () => {
@@ -262,7 +273,7 @@ export function splitMarkdownIntoSemanticBlocks(markdown: string): string[] {
     if (trimmed.startsWith('```')) {
       inCodeFence = !inCodeFence;
       buffer.push(line);
-      if (!inCodeFence) {
+      if (!inCodeFence && !inCalloutFence) {
         flush();
       }
       continue;
@@ -270,6 +281,27 @@ export function splitMarkdownIntoSemanticBlocks(markdown: string): string[] {
 
     if (inCodeFence) {
       buffer.push(line);
+      continue;
+    }
+
+    if (
+      !inCalloutFence &&
+      /^:::(theorem|definition|example|warning|summary|proof|insight|callout)\b/i.test(trimmed)
+    ) {
+      if (buffer.length > 0) {
+        flush();
+      }
+      inCalloutFence = true;
+      buffer.push(line);
+      continue;
+    }
+
+    if (inCalloutFence) {
+      buffer.push(line);
+      if (trimmed === ':::') {
+        inCalloutFence = false;
+        flush();
+      }
       continue;
     }
 
@@ -534,8 +566,10 @@ export function reconcileJobsWithServer(
         mergedMap.set(lj.id, lj);
       }
     } else {
-      // Local-only job: check if it was stranded in an active stage with no server worker
-      if (isJobActiveStage(lj.stage)) {
+      // Local-only job: only convert legacy client-side jobs (`executionHost !== 'server_cloud'`)
+      // into 'error' if stranded. Server-hosted jobs continue running autonomously in the cloud
+      // even when `/api/jobs` is momentarily polled before Firebase Auth finishes restoring token!
+      if (isJobActiveStage(lj.stage) && lj.executionHost !== 'server_cloud') {
         mergedMap.set(lj.id, {
           ...lj,
           stage: 'error',

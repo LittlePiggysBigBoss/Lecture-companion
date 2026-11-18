@@ -196,11 +196,22 @@ async function renderDomViaHeadlessChromium(url: string): Promise<string | null>
         '--no-sandbox',
         '--disable-gpu',
         '--disable-dev-shm-usage',
+        '--disable-extensions',
+        '--no-first-run',
+        '--log-level=3',
         '--virtual-time-budget=4500',
         '--dump-dom',
         url,
       ],
-      { timeout: 18_000, maxBuffer: 15 * 1024 * 1024 }
+      {
+        timeout: 18_000,
+        maxBuffer: 15 * 1024 * 1024,
+        env: {
+          ...process.env,
+          DBUS_SESSION_BUS_ADDRESS: 'disabled:',
+          DBUS_SYSTEM_BUS_ADDRESS: 'disabled:',
+        },
+      }
     );
     return stdout || null;
   } catch {

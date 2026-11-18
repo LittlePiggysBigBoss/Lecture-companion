@@ -2,7 +2,7 @@ import type {
   PipelineJob,
   RecognizedLinkKind,
   ScannedLinkResult,
-} from '../types';
+} from '../types.ts';
 
 export interface RecognizedLinkDescriptor {
   url: string;

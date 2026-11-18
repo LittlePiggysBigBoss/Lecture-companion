@@ -239,10 +239,11 @@ test('computeResumeDescriptor jumps straight to archiving when all batches alrea
   assert.equal(archiveOnly.resumePhase, 'archiving');
 });
 
-test('reconcileJobsWithServer converts orphaned local executing jobs into resumable error state', () => {
+test('reconcileJobsWithServer converts orphaned browser-local executing jobs into error state while preserving server_cloud jobs', () => {
   const orphanLocal: PipelineJob = {
     ...makeSampleFailedJob(),
     id: 'orphan-local-1',
+    executionHost: 'local',
     stage: 'executing',
     errorMessage: undefined,
   };
@@ -250,5 +251,32 @@ test('reconcileJobsWithServer converts orphaned local executing jobs into resuma
   assert.equal(reconciled.length, 1);
   assert.equal(reconciled[0].stage, 'error');
   assert.ok(reconciled[0].errorMessage?.includes('断点继续'));
+
+  const serverCloudRunning: PipelineJob = {
+    ...makeSampleFailedJob(),
+    id: 'cloud-running-1',
+    executionHost: 'server_cloud',
+    stage: 'executing',
+    errorMessage: undefined,
+  };
+  const cloudReconciled = reconcileJobsWithServer([serverCloudRunning], [], []);
+  assert.equal(cloudReconciled[0].stage, 'executing');
 });
+
+test('evaluateBatchContinuation detects unclosed :::theorem callout blocks and mid-clause stops', () => {
+  const unclosedCallout = evaluateBatchContinuation(
+    ':::theorem 定理 3.1：高斯定理\n穿过任意闭合曲面的电通量等于该闭合曲面内电荷代数和除以 $\\varepsilon_0$',
+    'STOP',
+    0
+  );
+  assert.equal(unclosedCallout.shouldContinue, true);
+
+  const midClause = evaluateBatchContinuation(
+    '## 第三节 动量守恒\n将上式两边同时对时间求导可得：',
+    'STOP',
+    0
+  );
+  assert.equal(midClause.shouldContinue, true);
+});
+
 

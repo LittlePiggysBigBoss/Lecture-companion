@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url';
 import mammoth from 'mammoth';
 import type {
   AttachmentSummary,
+  ColorPaletteTheme,
   DepthPreset,
   DocMode,
+  PageOrientationMode,
   PipelineJob,
   PostCompletionExpansionMode,
   PricingConfig,
@@ -25,6 +27,7 @@ import {
   deleteServerJob,
   expandCompletedServerJob,
   getCachedDriveTokenForUser,
+  getJobMediaFile,
   getServerJob,
   listServerJobs,
   listServerJobsForUser,
@@ -61,6 +64,11 @@ import {
   computeMonthlyPlanEconomics,
   estimateTaskTokenAndPrice,
 } from './src/utils/billingAndQuota.ts';
+import {
+  COLOR_PALETTE_THEMES,
+  DOCUMENT_TOOL_MODEL_REGISTRY,
+  QUALITY_SWEET_SPOT_WORDS_BY_DEPTH,
+} from './src/utils/modelRegistryAndRouter.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -111,7 +119,17 @@ async function startServer() {
       ok: true,
       model: CARBON_MODEL,
       transcribeModel: TRANSCRIBE_MODEL,
+      registeredToolModelsCount: DOCUMENT_TOOL_MODEL_REGISTRY.length,
       hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    });
+  });
+
+  app.get('/api/models/registry', (_req: Request, res: Response) => {
+    res.json({
+      orchestratorModel: CARBON_MODEL,
+      models: DOCUMENT_TOOL_MODEL_REGISTRY,
+      colorThemes: Object.values(COLOR_PALETTE_THEMES),
+      qualityTargetsByDepth: QUALITY_SWEET_SPOT_WORDS_BY_DEPTH,
     });
   });
 
@@ -407,6 +425,9 @@ async function startServer() {
         mode = 'lecture_notes',
         depth = 'comprehensive',
         volumeSplitMode = 'auto',
+        pageOrientation = 'auto',
+        colorTheme = 'academic_blue',
+        autoGenerateFigures = true,
         rawUserPrompt = '',
         customRootFolder = 'Carbon 学术归档',
         autoArchiveDrive = true,
@@ -420,6 +441,9 @@ async function startServer() {
         mode?: DocMode;
         depth?: DepthPreset;
         volumeSplitMode?: VolumeSplitMode;
+        pageOrientation?: PageOrientationMode;
+        colorTheme?: ColorPaletteTheme;
+        autoGenerateFigures?: boolean;
         rawUserPrompt?: string;
         customRootFolder?: string;
         autoArchiveDrive?: boolean;
@@ -498,6 +522,9 @@ async function startServer() {
         mode,
         depth,
         volumeSplitMode,
+        pageOrientation,
+        colorTheme,
+        autoGenerateFigures,
         rawUserPrompt,
         customRootFolder,
         autoArchiveDrive,
@@ -751,8 +778,12 @@ async function startServer() {
         job.plan?.suggestedFileName ||
         `${job.plan?.documentTitle || 'Carbon_Document'}.pdf`;
       const downloadName = encodeURIComponent(rawFileName);
+      const isInlinePreview = req.query.inline === '1' || req.query.inline === 'true';
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${downloadName}`);
+      res.setHeader(
+        'Content-Disposition',
+        `${isInlinePreview ? 'inline' : 'attachment'}; filename*=UTF-8''${downloadName}`
+      );
       res.send(pdfBuf);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -766,6 +797,18 @@ async function startServer() {
 
   app.get('/api/jobs/:id/volumes/:volumeId/pdf', async (req: Request, res: Response) => {
     await serveJobOrVolumePdf(req, res, String(req.params.volumeId));
+  });
+
+  // Serves Nano Banana generated academic figures for live preview & client PDF export
+  app.get('/api/jobs/:id/media/:fileName', (req: Request, res: Response) => {
+    const media = getJobMediaFile(String(req.params.id), String(req.params.fileName));
+    if (!media) {
+      res.status(404).json({ error: 'MEDIA_NOT_FOUND' });
+      return;
+    }
+    res.setHeader('Content-Type', media.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.sendFile(media.filePath);
   });
 
   app.post('/api/jobs/attach-token', async (req: Request, res: Response) => {
@@ -824,7 +867,9 @@ async function startServer() {
   });
 
   const distPath = path.resolve(__dirname, 'dist');
-  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
+  const isProd =
+    (process.env.NODE_ENV === 'production' || Boolean(process.env.K_SERVICE)) &&
+    fs.existsSync(distPath);
 
   if (isProd) {
     app.use(express.static(distPath));

@@ -13,9 +13,11 @@ import {
 import type {
   ActiveNavTab,
   AdminSystemOverview,
+  ColorPaletteTheme,
   DepthPreset,
   DocMode,
   GeneratedVolumeArtifact,
+  PageOrientationMode,
   PipelineJob,
   PostCompletionExpansionMode,
   PricingConfig,
@@ -93,10 +95,13 @@ export default function App() {
   const [accountProfile, setAccountProfile] = useState<UserAccountProfile | null>(null);
   const [pricingConfig, setPricingConfig] = useState<PricingConfig>(DEFAULT_PRICING_CONFIG);
 
-  // Composer Form State + Historical Memory & Link Scanner State
+  // Composer Form State + Multi-Model Palette/Figures + Historical Memory & Link Scanner State
   const [mode, setMode] = useState<DocMode>('lecture_notes');
   const [depth, setDepth] = useState<DepthPreset>('comprehensive');
   const [volumeSplitMode, setVolumeSplitMode] = useState<VolumeSplitMode>('auto');
+  const [pageOrientation, setPageOrientation] = useState<PageOrientationMode>('auto');
+  const [colorTheme, setColorTheme] = useState<ColorPaletteTheme>('academic_blue');
+  const [autoGenerateFigures, setAutoGenerateFigures] = useState(true);
   const [prompt, setPrompt] = useState('');
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([]);
   const [composerScannedLinks, setComposerScannedLinks] = useState<ScannedLinkResult[]>([]);
@@ -220,6 +225,13 @@ export default function App() {
       window.removeEventListener('online', onVisibilityOrOnline);
     };
   }, [syncAccountProfile, syncWithServerJobs]);
+
+  const mainViewportRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    mainViewportRef.current?.scrollTo({ top: 0 });
+    window.scrollTo({ top: 0 });
+  }, [activeTab, selectedJobId]);
 
   const hasAnyActiveJob =
     activeServerJobIds.length > 0 || jobs.some((j) => isJobActiveStage(j.stage));
@@ -687,6 +699,9 @@ export default function App() {
           mode,
           depth,
           volumeSplitMode,
+          pageOrientation,
+          colorTheme,
+          autoGenerateFigures,
           rawUserPrompt: prompt.trim(),
           customRootFolder: customRootFolder.trim() || 'Carbon 学术归档',
           autoArchiveDrive,
@@ -741,6 +756,7 @@ export default function App() {
       setActiveTab('monitor');
       setPrompt('');
       setVolumeSplitMode('auto');
+      setPageOrientation('auto');
       setAttachments([]);
       setComposerScannedLinks([]);
       setSourceContextJobIds([]);
@@ -1428,7 +1444,7 @@ export default function App() {
         )}
 
         {/* Main Viewport */}
-        <main className="flex-1 p-4 sm:p-8 overflow-y-auto">
+        <main ref={mainViewportRef} className="flex-1 p-4 sm:p-8 overflow-y-auto">
           {activeTab === 'composer' && (
             <ComposerPanel
               mode={mode}
@@ -1437,6 +1453,12 @@ export default function App() {
               onDepthChange={setDepth}
               volumeSplitMode={volumeSplitMode}
               onVolumeSplitModeChange={setVolumeSplitMode}
+              pageOrientation={pageOrientation}
+              onPageOrientationChange={setPageOrientation}
+              colorTheme={colorTheme}
+              onColorThemeChange={setColorTheme}
+              autoGenerateFigures={autoGenerateFigures}
+              onAutoGenerateFiguresChange={setAutoGenerateFigures}
               prompt={prompt}
               onPromptChange={(val) => {
                 setPrompt(val);

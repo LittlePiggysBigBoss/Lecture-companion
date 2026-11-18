@@ -64,6 +64,92 @@ export type PostCompletionExpansionMode = 'append_in_place' | 'derive_new_job';
 
 export type VolumeSplitMode = 'auto' | 'multi_volume' | 'single_file';
 
+export type PageOrientationMode = 'auto' | 'portrait' | 'landscape';
+
+export type ColorPaletteTheme =
+  | 'academic_blue'
+  | 'emerald_science'
+  | 'amber_olympiad'
+  | 'burgundy_editorial';
+
+export type ModuleSpecialistRole =
+  | 'orchestration_and_proof'
+  | 'stem_problem_derivation'
+  | 'conceptual_prose_and_color_layout'
+  | 'lean_transition_and_index'
+  | 'hd_scientific_illustration'
+  | 'fast_schematic_diagram'
+  | 'studio_cover_visual'
+  | 'rubric_quality_gate'
+  | 'voice_audio_transcribe'
+  | 'semantic_dedup_embedding'
+  | 'lecture_tts_narration'
+  | 'dynamic_video_extension';
+
+export type ToolModelFamily =
+  | 'reasoning_core'
+  | 'efficient_prose'
+  | 'nano_banana_vision'
+  | 'multimodal_utility';
+
+export type ToolModelModality =
+  | 'text_reasoning'
+  | 'image_generation'
+  | 'calibrated_decision'
+  | 'audio_speech'
+  | 'multimodal_embedding'
+  | 'video_generation';
+
+export interface ToolModelRegistryEntry {
+  modelId: string;
+  codeName: string;
+  displayName: string;
+  family: ToolModelFamily;
+  modality: ToolModelModality;
+  primaryRoles: ModuleSpecialistRole[];
+  bestForSummary: string;
+  workflowStages: string[];
+  /** Relative token cost index vs Carbon baseline (1.00 = Carbon) */
+  relativeTokenCostIndex: number;
+  recommendedMaxWordsPerCall?: number;
+  supportsThinkingLevels?: Array<'LOW' | 'MEDIUM' | 'HIGH'>;
+  activeInPipeline: boolean;
+}
+
+export interface VisualFigureSpec {
+  figureId: string;
+  caption: string;
+  prompt: string;
+  aspectRatio: '16:9' | '4:3' | '1:1' | '3:4';
+  assignedImageModelId:
+    | 'gemini-nano-banana-2.1'
+    | 'gemini-3.1-flash-lite-image'
+    | 'gemini-3-pro-image';
+  placementSectionHint?: string;
+}
+
+export interface GeneratedFigureAsset {
+  figureId: string;
+  batchIndex: number;
+  volumeId?: string;
+  caption: string;
+  modelUsed: string;
+  aspectRatio: string;
+  mimeType: string;
+  mediaUrl: string;
+  createdAt: string;
+}
+
+export interface ModelUsageStat {
+  modelId: string;
+  codeName: string;
+  roleSummary: string;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  generatedImages?: number;
+}
+
 export type VolumeRole =
   | 'main_lecture'
   | 'workbook'
@@ -158,6 +244,12 @@ export interface TaskBatchSpec {
   includeAnswerKey: boolean;
   volumeId?: string;
   volumeIndex?: number;
+  /** Specialist model dispatched by Carbon for this specific module */
+  assignedModelId?: string;
+  specialistRole?: ModuleSpecialistRole;
+  dispatchReason?: string;
+  /** Optional Nano Banana figure generation specs planned for this module */
+  visualFigures?: VisualFigureSpec[];
   isSupplementalBatch?: boolean;
   isExpansionBatch?: boolean;
   isAutoOverflowRound?: boolean;
@@ -177,6 +269,11 @@ export interface ExpandedPlan {
   volumes?: OutputVolumeSpec[];
   singleCallTargetWords?: number;
   adaptiveStrategyNote?: string;
+  colorTheme?: ColorPaletteTheme;
+  pageOrientation?: PageOrientationMode;
+  autoGenerateFigures?: boolean;
+  multiModelDispatchSummary?: string;
+  orchestrationSummary?: string;
   batches: TaskBatchSpec[];
 }
 
@@ -189,6 +286,11 @@ export interface BatchExecutionState {
   title: string;
   volumeId?: string;
   volumeIndex?: number;
+  assignedModelId?: string;
+  modelUsed?: string;
+  specialistRole?: ModuleSpecialistRole;
+  dispatchReason?: string;
+  generatedFigures?: GeneratedFigureAsset[];
   status: BatchStatus;
   continuationCount: number;
   autoRetryCount?: number;
@@ -260,6 +362,20 @@ export interface PipelineJob {
   mode: DocMode;
   depth: DepthPreset;
   volumeSplitMode?: VolumeSplitMode;
+  /** Page orientation for PDF layout: auto-detected or explicit portrait A4 / landscape PPT-ready */
+  pageOrientation?: PageOrientationMode;
+  /** Selected publication color theme for callout boxes, tables, and diagrams */
+  colorTheme?: ColorPaletteTheme;
+  /** Whether Carbon automatically dispatches Nano Banana models to craft figures */
+  autoGenerateFigures?: boolean;
+  /** Generated Nano Banana figures across all modules */
+  generatedFigures?: GeneratedFigureAsset[];
+  /** Per-model dispatch & token efficiency telemetry */
+  modelUsageBreakdown?: ModelUsageStat[];
+  /** Estimated token cost saved (%) via Carbon's multi-model specialist routing vs 100% Carbon */
+  multiModelTokenCostSavingsPct?: number;
+  /** True after final seamless assembly & cross-module formatting stitch */
+  isStitchedAndPolished?: boolean;
   rawUserPrompt: string;
   customRootFolder: string;
   autoArchiveDrive: boolean;
@@ -274,6 +390,10 @@ export interface PipelineJob {
   /** True when PDF resides solely in user's own Google Cloud and downloads locally only on click */
   cloudOnlyHosted?: boolean;
   autoRecoveryCount?: number;
+  /** Number of autonomous background watchdog self-heals performed */
+  autoHealWatchdogCount?: number;
+  /** ISO timestamp updated continuously during streaming/planning for stall detection */
+  lastHeartbeatAt?: string;
   plan: ExpandedPlan | null;
   batches: BatchExecutionState[];
   compiledMarkdown: string;

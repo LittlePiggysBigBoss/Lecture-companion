@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildDeterministicFallbackPlan,
   buildTokenEfficientExecutionContext,
   computeVolumeArtifactsFromBatches,
   consolidateRequirementsPure,
@@ -185,6 +186,8 @@ test('normalizeAdaptivePlanAndVolumes preserves unbounded round counts (e.g. 7 r
   assert.equal(plan.isMultiVolume, true);
   assert.equal(plan.volumes?.length, 3);
   assert.equal(plan.batches.length, 7);
+  // Verifies quality-first moderate per-call target clamping (never bloated to 11,500) + specialist model routing
+  assert.ok(plan.batches.every((b) => b.targetWords <= 5600 && Boolean(b.assignedModelId)));
 
   const artifacts = computeVolumeArtifactsFromBatches({
     plan,
@@ -241,3 +244,34 @@ test('buildTokenEfficientExecutionContext dramatically trims continuation contex
   );
   assert.ok(continuationPack.memoryContextBlock.includes('定理'));
 });
+
+test('buildDeterministicFallbackPlan synthesizes valid multi-volume landscape plan when upstream JSON planner times out', () => {
+  const prompt =
+    '继续撰写升级改进这份讲义，按照板块units把讲义拆分为三份，并且例题和训练题的答案解析单独成册，同时调整成横版pdf可以当成ppt使用的版式';
+  const splitDet = detectMultiVolumeIntent({ rawPrompt: prompt });
+  const consolidated = consolidateRequirementsPure({ rawUserPrompt: prompt });
+
+  assert.ok(
+    consolidated.activeRules.some(
+      (r) => r.status === 'active' && r.summary.includes('横版 A4')
+    )
+  );
+
+  const fallbackPlan = buildDeterministicFallbackPlan({
+    mode: 'lecture_notes',
+    depth: 'comprehensive',
+    customRootFolder: 'Carbon 学术归档',
+    rawUserPrompt: prompt,
+    consolidatedMasterBrief: consolidated.synthesizedMasterBrief,
+    multiVolumeDetection: splitDet,
+    pageOrientation: 'auto',
+    referenceJobTitle: 'Physics Bowl 竞赛讲义全集',
+  });
+
+  assert.equal(fallbackPlan.pageOrientation, 'landscape');
+  assert.equal(fallbackPlan.isMultiVolume, true);
+  assert.ok((fallbackPlan.volumes?.length || 0) >= 2);
+  assert.ok(fallbackPlan.batches.length >= 2);
+  assert.ok(fallbackPlan.batches.every((b) => b.targetWords > 0 && Boolean(b.assignedModelId)));
+});
+
